@@ -1,12 +1,17 @@
 #!/bin/bash
-# End-to-end `escpod align` benchmark across the kernel backends and devices.
+# End-to-end `eschalign` benchmark across the kernel backends and devices.
 #
 # Runs the same alignment once per arm — a binary (`--bin`, repeatable, so a
 # base build can be measured beside a new one), crossed with a CPU backend
-# (`ESCAPEPOD_ALIGN_BACKEND` caps the dispatch) and a `--device` — interleaved
+# (`ESCHALIGN_BACKEND` caps the dispatch) and a `--device` — interleaved
 # and repeated, and
 # reports wall, CPU, MaxRSS and reads/s per run. The DP's cost is data-independent — reads x references x
 # lengths — so any real sample against any panel measures the right thing.
+#
+# `--bin` is any program taking `READS -r REF -o OUT ...` directly; to measure
+# a legacy `escpod` (escapepod-rs) beside this build, point `--bin` at a
+# two-line wrapper that runs `exec escpod align "$@"` (its `--version` must
+# answer too).
 #
 # Usage:
 #   benchmarks/benchmark_align.sh --reads FILE --reference FA \
@@ -20,7 +25,7 @@
 # the tracebacks and any read the GPU leaves to the CPU, and the run is checked
 # to have actually placed scoring on the GPU. A GPU arm needs a `gpu` build and
 # a GPU allocation (`srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1`). Arguments
-# after `--` go to escpod align (a global flag such as `-v` works there too; its
+# after `--` go to eschalign (a global flag such as `-v` works there too; its
 # "workers were busy" line is echoed to stderr per run).
 #
 # `--md5` also prints, per run, the md5 of the output's records
@@ -29,8 +34,8 @@
 # call. `samtools` comes from PATH, or from `$SAMTOOLS`, or from `--samtools`.
 #
 # `--sort` adds an output-order axis (default: the flag is not passed):
-# `unsorted` and `coordinate` are `escpod align --sort ...`; `samtools` is the
-# shape it replaces, `escpod align -o - | samtools sort -@ THREADS`, timed as
+# `unsorted` and `coordinate` are `eschalign --sort ...`; `samtools` is the
+# shape it replaces, `eschalign -o - | samtools sort -@ THREADS`, timed as
 # one pipeline (CPU summed over both, MaxRSS the larger of the two).
 #
 # The same rules as benchmark_charging.sh: arms are INTERLEAVED (A B C A B C),
@@ -66,10 +71,10 @@ done
 [[ ${#backends[@]} -gt 0 ]] || backends=(avx512 avx2 scalar)
 [[ ${#devices[@]} -gt 0 ]] || devices=("-")
 [[ ${#sorts[@]} -gt 0 ]] || sorts=("-")
-[[ ${#bins[@]} -gt 0 ]] || bins=("./target/release/escpod")
+[[ ${#bins[@]} -gt 0 ]] || bins=("./target/release/eschalign")
 threads="${threads:-${SLURM_CPUS_PER_TASK:-$(nproc)}}"
 
-scratch="$(mktemp -d "${TMPDIR:-/tmp}/escpod-align-bench.XXXXXX")"
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/eschalign-bench.XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
 
 echo "# $(hostname) $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //')" >&2
@@ -90,8 +95,8 @@ for rep in $(seq 1 "$reps"); do
         if [[ "$so" == "samtools" ]]; then
             # GNU time reports its child's rusage, and bash waits for both
             # sides of the pipe: CPU is the sum, MaxRSS the larger process.
-            ESCAPEPOD_ALIGN_BACKEND="$be" /usr/bin/time -v bash -o pipefail -c '
-                "$1" align "$2" -r "$3" -o - -t "$4" "${@:8}" \
+            ESCHALIGN_BACKEND="$be" /usr/bin/time -v bash -o pipefail -c '
+                "$1" "$2" -r "$3" -o - -t "$4" "${@:8}" \
                     | "$5" sort -@ "$4" -T "$6/st" -o "$7" -' _ \
                 "$bin" "$reads" "$reference" "$threads" "$samtools" "$scratch" \
                 "$scratch/out.bam" "${dev_args[@]}" "${extra[@]}" \
@@ -99,8 +104,8 @@ for rep in $(seq 1 "$reps"); do
         else
             sort_args=()
             [[ "$so" == "-" ]] || sort_args=(--sort "$so")
-            ESCAPEPOD_ALIGN_BACKEND="$be" /usr/bin/time -v \
-                "$bin" align "$reads" -r "$reference" -o "$scratch/out.bam" -t "$threads" \
+            ESCHALIGN_BACKEND="$be" /usr/bin/time -v \
+                "$bin" "$reads" -r "$reference" -o "$scratch/out.bam" -t "$threads" \
                 "${dev_args[@]}" "${sort_args[@]}" "${extra[@]}" \
                 2> "$log" || { cat "$log" >&2; exit 1; }
         fi

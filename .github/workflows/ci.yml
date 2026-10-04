@@ -1,0 +1,112 @@
+name: CI
+
+# Docs and prose never affect a Rust build, so they do not start one. A commit
+# touching both prose and code is NOT skipped: `paths-ignore` suppresses a run
+# only when *every* changed path matches.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE*'
+      - '.gitignore'
+
+# Least privilege: CI only ever reads the tree.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref; never cancel main-branch pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  # No separate `check` job: `cargo clippy --workspace --all-targets` runs the
+  # same front-end as `cargo check` and adds lints.
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace
+      # Doctests share this job's unit graph (nextest does not run them), which
+      # makes them nearly free; a job of their own rebuilt everything.
+      - name: Doctests
+        run: cargo test --doc --workspace
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No rust-cache: rustfmt never builds the dependency graph.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The default jobs never compile the opt-in `gpu` feature, so a cudarc bump
+  # could break it while everything else stays green. cudarc dlopens, so this
+  # needs no CUDA toolkit or GPU. Clippy, not check: `-Dwarnings` only denies
+  # lints that are evaluated, and `cargo check` evaluates no clippy lint.
+  features:
+    name: Feature build (gpu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --workspace --all-targets --features gpu -- -D warnings
+
+  msrv:
+    name: MSRV (1.95)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --workspace

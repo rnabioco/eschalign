@@ -1,4 +1,4 @@
-# escpod align
+# eschalign
 
 All-against-all alignment of reads to a small reference panel: every read is
 scored against every reference, the best-scoring reference is reported, and
@@ -7,10 +7,11 @@ MAPQ of zero. Built for tRNA panels (~150–200 references of ~150 nt), where it
 replaces `bwa mem` + `samtools calmd`.
 
 ```bash
-escpod align reads.ubam -r trna.fa -o aligned.bam
+eschalign reads.ubam -r trna.fa -o aligned.bam
 ```
 
-Ships in the default build — no extra Cargo feature.
+One flat binary, no subcommand. Panel scoring on the GPU needs a build with
+`--features gpu`; everything else is in the default build.
 
 There is no seed index. Memory is one batch of reads, and runtime is a function
 of `reads × references × lengths` alone — the same for every sample of the same
@@ -21,7 +22,7 @@ panel beyond it gets a warning and proportionally more runtime.
 ## Usage
 
 ```bash
-escpod align [OPTIONS] -r <FASTA> -o <BAM> <READS>
+eschalign [OPTIONS] -r <FASTA> -o <BAM> <READS>
 ```
 
 ## Arguments
@@ -104,7 +105,7 @@ Records come out in **input order** (`@HD SO:unsorted`) by default, or
 coordinate-sorted with `--sort coordinate` (see [Sorted output](#sorted-output)).
 The header is
 `@SQ` from the reference in file order, the input's `@RG`, `@PG` and `@CO`
-copied through, and one `@PG ID:escpod-align` for this run, chained to the last.
+copied through, and one `@PG ID:eschalign` for this run, chained to the last.
 
 **Every input tag is copied byte for byte** — `mv`, `ns`, `ts`, `MM`/`ML`,
 `RG`, `qs`, `du`, `ch`, `st`, and the rest. `NM`, `MD`, `AS`, `XS` and `XA` are
@@ -162,7 +163,7 @@ unlinked as soon as it is created, so nothing is left behind on any exit.
 
 The scorer treats a reference `N` as matching anything. `MD` and `NM` do not:
 they are exactly what `samtools calmd` writes for the same CIGAR, because the
-windowed charging bundle in `escpod classify` rebuilds each read's reference
+windowed charging classifier in escapepod-rs rebuilt each read's reference
 from `MD`, and a reference `N` that vanished from `MD` would silently put the
 read's own base in its place. Measured on samtools 1.23.1 and pinned by a
 golden:
@@ -190,8 +191,10 @@ adapter-only read on an adapter-flanked panel does) costs about what scoring
 it did. Every kernel is tested for equality against a scalar reference
 implementation, which is itself tested against parasail.
 
-`ESCAPEPOD_ALIGN_BACKEND=scalar|avx2|avx512` caps the kernel choice, for A/B
+`ESCHALIGN_BACKEND=scalar|avx2|avx512` caps the kernel choice, for A/B
 measurements; the run's second log line names the kernel in use.
+`ESCAPEPOD_ALIGN_BACKEND` is the same switch under its old escapepod-rs name,
+kept as a **deprecated alias**; `ESCHALIGN_BACKEND` wins when both are set.
 
 ### Long reads
 
@@ -223,8 +226,10 @@ things keep the long ones from holding up the run:
 
 Both give the same scores as before, so the output is identical. With
 `--device gpu`, reads over 4,096 nt are left to the CPU and take the same
-path. `ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY=1` turns both off — every read on the
+path. `ESCHALIGN_ROW_MAJOR_ONLY=1` turns both off — every read on the
 original layout and one thread per unit of work — for A/B measurements only.
+(`ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY` is a deprecated alias; the new name wins
+whenever it is set, even to `0`.)
 
 ### Performance
 
@@ -250,7 +255,7 @@ On a gpu node (`-c 16`, one A30), the 3.3 M-read sample takes ~70 s and ~700
 CPU-seconds with GPU scoring against 184 s and ~2,900 CPU-seconds on the same
 16 cores without it, so `--device auto` uses the GPU when one is visible. Nothing
 CUDA is needed to build; at run time the GPU path needs the CUDA driver and
-NVRTC (`pixi run install-gpu` sets both up). Details in
+NVRTC (`pixi run install-gpu` sets up the NVRTC half). Details in
 `benchmarks/README.md`.
 
 ## Replacing bwa in a pipeline
@@ -266,18 +271,18 @@ samtools view -u -N ids.txt reads.ubam \
 samtools calmd -Qb aln.bam ref.fa > aln.calmd.bam
 ```
 
-`escpod align` does all of it in one process — the tags ride through without
+`eschalign` does all of it in one process — the tags ride through without
 the FASTQ-comment round trip, the uBAM's `@RG` lines are copied without the
 `-H` header hack, `MD` is written at alignment time, and `--sort coordinate`
 replaces the sort:
 
 ```bash
-escpod align reads.ubam -r ref.fa -o aln.bam --read-ids ids.txt --scoring 1,-1,-2,-1 \
+eschalign reads.ubam -r ref.fa -o aln.bam --read-ids ids.txt --scoring 1,-1,-2,-1 \
     --sort coordinate
 samtools index aln.bam
 ```
 
-`escpod classify` reads either order. Unmapped reads are written, never
+`escpod classify` (escapepod-rs) reads either order. Unmapped reads are written, never
 dropped; `samtools view -F 2324` reproduces the old output's contents exactly
 (primary, forward, mapped records) if that is wanted, and a filtered sorted
 file stays sorted. Stamping sample/barcode read groups stays pipeline plumbing.
@@ -285,7 +290,7 @@ file stays sorted. Stamping sample/barcode read groups stays pipeline plumbing.
 The scoring scheme is the pipeline's call, judged by charging-call agreement:
 `--scoring 1,-1,-2,-1` is bwa `-x ont2d`'s penalties, but bwa also clips, bands
 and chains, so the same scores do not give the same CIGAR for every read. On
-the classify test fixture, 27 of 60 reads get a different CIGAR (or start) from
+escapepod-rs's classify test fixture (the same 60 reads as `crates/eschalign-cli/tests/fixtures`), 27 of 60 reads get a different CIGAR (or start) from
 bwa's; the charging calls of every read whose alignment is unchanged are
 bit-identical.
 
@@ -293,14 +298,34 @@ bit-identical.
 
 ```bash
 # dorado uBAM in, aligned BAM out
-escpod align calls.ubam -r trna.fa -o aligned.bam -t 32
+eschalign calls.ubam -r trna.fa -o aligned.bam -t 32
 
 # FASTQ, overlap mode, gap-lenient scores
-escpod align reads.fq.gz -r trna.fa -o aligned.bam --mode semiglobal --scoring 1,-1,-2,-1
+eschalign reads.fq.gz -r trna.fa -o aligned.bam --mode semiglobal --scoring 1,-1,-2,-1
 
 # Coordinate-sorted, ready for samtools index
-escpod align calls.ubam -r trna.fa -o aligned.bam --sort coordinate
+eschalign calls.ubam -r trna.fa -o aligned.bam --sort coordinate
 
 # Ties as secondary records, at most 5 per read
-escpod align calls.ubam -r trna.fa -o aligned.bam --secondary --max-ties 5
+eschalign calls.ubam -r trna.fa -o aligned.bam --secondary --max-ties 5
 ```
+
+## Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `ESCHALIGN_BACKEND` | Cap the SIMD kernel: `scalar`, `avx2` or `avx512` |
+| `ESCHALIGN_ROW_MAJOR_ONLY` | `1`/`true`/`yes`/`on` turns the long-read paths off (A/B only); `0`/`false`/`no`/`off`/unset leaves them on |
+| `RUST_LOG` | Overrides `-v`/`-q`; `eschalign=debug` etc. |
+| `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE` | The usual colour conventions for status lines |
+| `RAYON_NUM_THREADS` | Thread count when `-t` is not given |
+
+Deprecated aliases from escapepod-rs (`escpod align`): `ESCAPEPOD_ALIGN_BACKEND`
+and `ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY`. They still work; the `ESCHALIGN_*` name
+wins whenever both are set.
+
+## Logging
+
+Status goes to stderr through `tracing` — info by default, `-v` debug, `-vv`
+trace, `-q` errors only; dependencies are held at `warn`. Only the BAM (under
+`-o -`) goes to stdout.
