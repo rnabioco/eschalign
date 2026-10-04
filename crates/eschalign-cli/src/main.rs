@@ -30,10 +30,12 @@ mod uuid_util;
 
 /// Terse event formatter: `YYYY-MM-DD HH:MM:SS  LEVEL [target] message`.
 ///
-/// The binary's own events (targets `eschalign_cli` / `eschalign_cli::*`) are
+/// The binary's own events (modules of this crate, whose target prefix is
+/// `eschalign::` because the binary and the library share a crate name) are
 /// the primary status channel, so their target is omitted to keep status lines
-/// clean. The library's (`eschalign::*`) are shown without the crate prefix;
-/// all other (external) targets are printed verbatim so `-v` can attribute them.
+/// clean. The library's (`eschalign::simd`, …) are shown without the crate
+/// prefix; all other (external) targets are printed verbatim so `-v` can
+/// attribute them.
 struct EschalignFormatter;
 
 impl<S, N> FormatEvent<S, N> for EschalignFormatter
@@ -52,11 +54,11 @@ where
         write!(writer, " {:>5}", event.metadata().level())?;
 
         let target = event.metadata().target();
-        if target == "eschalign_cli" || target.starts_with("eschalign_cli::") {
+        if is_own_target(target) {
             // The binary's own status output — no target label.
         } else if let Some(module) = target.strip_prefix("eschalign::") {
             write!(writer, " [{module}]")?;
-        } else if target != "eschalign" {
+        } else {
             write!(writer, " [{target}]")?;
         }
 
@@ -64,6 +66,29 @@ where
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
+}
+
+/// Whether `target` is one of this binary's own modules (or the crate root).
+/// The binary is named `eschalign`, like the library, so both share the
+/// `eschalign` prefix and the module name is what tells them apart.
+fn is_own_target(target: &str) -> bool {
+    const OWN_MODULES: [&str; 8] = [
+        "align",
+        "device",
+        "env",
+        "main",
+        "progress",
+        "style",
+        "threads",
+        "uuid_util",
+    ];
+    if target == "eschalign" || target == "eschalign_cli" || target.starts_with("eschalign_cli::") {
+        return true;
+    }
+    target
+        .strip_prefix("eschalign::")
+        .and_then(|m| m.split("::").next())
+        .is_some_and(|m| OWN_MODULES.contains(&m))
 }
 
 const STYLES: Styles = Styles::styled()
@@ -184,6 +209,15 @@ mod tests {
             "warn,eschalign=trace,eschalign_cli=trace"
         );
         assert_eq!(filter_directive(true, 2), "error");
+    }
+
+    #[test]
+    fn own_targets_are_unlabelled_and_library_targets_are_not() {
+        assert!(is_own_target("eschalign::align"));
+        assert!(is_own_target("eschalign::device"));
+        assert!(!is_own_target("eschalign::simd"));
+        assert!(!is_own_target("eschalign::cuda"));
+        assert!(!is_own_target("rayon_core"));
     }
 
     #[test]

@@ -43,10 +43,10 @@ impl fmt::Display for Device {
     }
 }
 
-/// The `--device` flag plus its `--cpu` alias.
-///
-/// `--cpu` conflicts with `--device`, so there is never a question of which
-/// one won.
+// The `--device` flag plus its `--cpu` alias. `--cpu` conflicts with
+// `--device`, so there is never a question of which one won. (A plain comment,
+// not a doc comment: clap would take a doc comment on a flattened struct as the
+// whole command's `about`.)
 #[derive(Debug, Default, clap::Args)]
 pub struct DeviceArgs {
     /// Where panel scoring runs: `auto` (default), `cpu`, or `gpu`.
