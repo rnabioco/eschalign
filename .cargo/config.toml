@@ -1,0 +1,33 @@
+# Pinned rustflags for local Linux/x86_64 builds.
+#
+# Baseline: `x86-64-v3` = SSE4.2 + AVX + AVX2 + FMA + BMI1/BMI2 + POPCNT + F16C.
+# Every x86_64 CPU in this cluster (Broadwell login node, Cascade Lake rna,
+# Ice Lake gpu) supports this. Features above v3 (AVX-512, VBMI, …) are not
+# pinned here — the rna partition lacks the Ice Lake-only flags (VBMI, etc.),
+# so a `target-cpu=native` binary produced on a gpu node fails to load on
+# rna. Hot kernels that want AVX-512 should use `#[target_feature]` +
+# runtime `is_x86_feature_detected!` dispatch, not a global baseline bump.
+#
+# Only applies to the x86_64 GNU target, and only where nothing else sets
+# RUSTFLAGS — an environment RUSTFLAGS replaces this wholesale rather than
+# adding to it. Every release artifact does set its own (see
+# .github/workflows/release.yml): the musl builds because they target musl,
+# and the `-gnu-gpu` build because it shares this triple but must pin its
+# baseline explicitly rather than inherit a file documented as local policy.
+# aarch64 and macOS are unaffected. Python wheels built by developers via
+# maturin/pip pick this up, which is fine since v3 is portable across
+# any x86_64 CPU since ~2013.
+#
+# Linker: mold is used full time inside pixi. It is engaged not by a cargo
+# linker override here but by the base `[activation]` block in pixi.toml, which
+# exports `LD_PRELOAD=$CONDA_PREFIX/lib/mold/mold-wrapper.so` +
+# `MOLD_PATH=$CONDA_PREFIX/bin/mold` for every environment. That wrapper
+# intercepts the linker exec and redirects it to mold, which works with the
+# stock system gcc 11.5 on the compute nodes — no `-fuse-ld=mold` support
+# needed (gcc gained that only in 12.1). No linker override is set here because
+# the earlier conda-clang route pulled in a sysroot that required glibc-static
+# (libmvec_nonshared.a), which isn't installed on the compute nodes; the
+# LD_PRELOAD interposer avoids that entirely and is compiler-version-agnostic.
+# CI release binaries (musl) build outside pixi and are unaffected.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

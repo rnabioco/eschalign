@@ -1,0 +1,9 @@
+/target/
+.pixi/
+*.bam
+!crates/eschalign-cli/tests/fixtures/*.bam
+*.bam.bai
+!crates/eschalign-cli/tests/fixtures/*.bam.bai
+*.profraw
+data/
+perf.data*

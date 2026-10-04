@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+repository = "https://github.com/rnabioco/eschalign"
+license = "MIT"
+readme = "README.md"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+# GPU acceleration (opt-in via the `gpu` feature; runtime-compiled CUDA kernels
+# via NVRTC). `dynamic-loading` means nothing CUDA is needed to build.
+cudarc = { version = "0.19", default-features = false, features = ["cuda-12020", "driver", "nvrtc", "std", "dynamic-loading"] }
+eschalign = { path = "crates/eschalign", version = "0.1.0" }
+indicatif = "0.18"
+rayon = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = "1"
+
+# Fast dev builds, but with optimized third-party crates so tests run
+# at a reasonable speed.
+[profile.dev.package."*"]
+opt-level = 2
+
+# The aligner's equality tests run the scalar oracle over reads of 20-60 kb
+# (and the end-to-end tests run the binary under the scalar backend on them);
+# at opt-level 0 that oracle costs ~80 ns a cell and those tests run for
+# minutes. Debug assertions and overflow checks stay on.
+[profile.dev.package.eschalign]
+opt-level = 2
+
+# `cargo bench` uses [profile.bench], which by default does NOT inherit from
+# [profile.release]; pin it so measurements match the shipped codegen.
+[profile.bench]
+inherits = "release"
+strip = false
+
+# Optimized release build: LTO + single codegen unit for maximum performance.
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+
+[profile.dist]
+inherits = "release"
+
+# Profiling build: drops LTO and splits codegen so frames aren't inlined away
+# from profilers (perf, samply). Slower than release, faithful call graphs.
+[profile.profiling]
+inherits = "release"
+debug = 2
+split-debuginfo = "packed"
+strip = false
+lto = false
+codegen-units = 16
+
+# Release-speed build with symbols preserved, for samply/perf recordings.
+[profile.release-with-debug]
+inherits = "release"
+debug = 2
+split-debuginfo = "packed"
+strip = false

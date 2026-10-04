@@ -1,0 +1,99 @@
+[workspace]
+name = "eschalign"
+channels = ["conda-forge", "bioconda"]
+# Two platforms for one machine type. `linux-64-cuda` is the same linux-64 with
+# `__cuda` asserted, which is what conda-forge's CUDA builds require in order to
+# solve at all. Only the `gpu` feature targets it (see `[feature.gpu]`); every
+# other environment carries the empty `cpu` feature below to stay pinned to
+# plain linux-64, so a developer without a GPU never has to satisfy `__cuda` and
+# their lock entries never move. Needs pixi >= 0.77 for the named-variant syntax.
+platforms = ["linux-64", { name = "linux-64-cuda", platform = "linux-64", cuda = "12" }]
+
+# Deliberately empty. Its only job is to pin an environment to plain `linux-64`
+# rather than letting it inherit both workspace platforms — which the implicit
+# `default` environment would otherwise do, so `default` is spelled out in
+# `[environments]` below purely to carry this.
+[feature.cpu]
+platforms = ["linux-64"]
+
+[dependencies]
+# The sort tests compare against `samtools sort` / `samtools view` when one is
+# on PATH, and benchmarks/benchmark_align.sh uses it for --md5 and --sort samtools.
+samtools = ">=1.23,<2"
+# mold is a base dependency so every environment links Rust with it — see the
+# LD_PRELOAD/MOLD_PATH block below. gcc 11.5 on the compute nodes has no
+# `-fuse-ld=mold` support, so we engage mold via its `mold-wrapper.so`
+# LD_PRELOAD interposer (exactly what `mold -run` does) rather than a cargo
+# linker override in .cargo/config.toml.
+mold = ">=2.4"
+
+# LD_PRELOAD makes mold the default linker for *every* command run in any pixi
+# environment (bare `cargo build`, `cargo nextest run`, …), full time. The
+# wrapper intercepts the linker exec and redirects it to mold; for non-linker
+# processes it is an inert passthrough. `$CONDA_PREFIX` resolves to the active
+# env prefix, so this works uniformly across default/dev/gpu/… without
+# hardcoding a path.
+[activation]
+env = { LD_PRELOAD = "$CONDA_PREFIX/lib/mold/mold-wrapper.so", MOLD_PATH = "$CONDA_PREFIX/bin/mold" }
+
+[tasks]
+# Create the `gpu` environment from a machine that has no GPU — which on a
+# cluster is the normal case, because the login node is the one with network
+# access and the GPU nodes are the ones with `__cuda`.
+#
+# Plain `pixi install -e gpu` fails there, and fails ugly: the `gpu` environment
+# targets the `linux-64-cuda` platform, whose `__cuda` virtual package a GPU-less
+# machine cannot provide, so the solver reports missing virtual packages. The
+# resolve itself is already done and committed in pixi.lock; the only thing
+# absent is the install-time probe, which is exactly what CONDA_OVERRIDE_CUDA
+# supplies. Nothing is being faked about the solution — the packages installed
+# are the ones the lockfile already names.
+#
+# On a GPU node this is unnecessary and `pixi install -e gpu` works directly.
+install-gpu = "CONDA_OVERRIDE_CUDA=12 pixi install -e gpu"
+
+# GPU (CUDA) feature: the runtime needs of `--features gpu`. cudarc dlopens
+# everything, so nothing here is needed at build time:
+#   * the CUDA driver (libcuda.so.1) comes from the node, not from conda;
+#   * NVRTC (libnvrtc.so.12) compiles the score kernel at run time.
+# There is no onnxruntime and no cuDNN in this tool.
+[feature.gpu]
+platforms = ["linux-64-cuda"]
+
+[feature.gpu.dependencies]
+cuda-version = "12.*"
+cuda-nvrtc = ">=12,<13"  # cudarc loads libnvrtc.so.12
+
+# LD_LIBRARY_PATH makes `$CONDA_PREFIX/lib` visible to cudarc's dlopen of
+# libnvrtc — the conda-forge CUDA packages ship no activation hook that sets it.
+[feature.gpu.activation]
+env = { LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH" }
+
+# Dev env: cargo-nextest plus convenience task wrappers. mold linking is on for
+# *every* environment via the base activation above, so these tasks are bare
+# `cargo …`.
+[feature.dev.dependencies]
+cargo-nextest = ">=0.9"
+
+[feature.dev.tasks]
+build = "cargo build"
+build-rel = "cargo build --release"
+# nextest does not run doctests; use the test-doc task for those.
+test = "cargo nextest run"
+test-doc = "cargo test --doc"
+check = "cargo check"
+clippy = "cargo clippy --workspace --all-targets"
+
+# Every non-GPU environment carries the empty `cpu` feature, which pins it to
+# plain `linux-64`. Without it an environment inherits both workspace platforms
+# and would need `__cuda` on machines that have no GPU.
+#
+# The GPU environments deliberately leave the `default` solve group: a solve
+# group cannot span platforms, so pixi resolves `linux-64-cuda` separately
+# whatever the group says.
+[environments]
+default = { features = ["cpu"] }
+dev = { features = ["dev", "cpu"], solve-group = "default" }
+gpu = { features = ["gpu"] }
+# dev + gpu combo for GPU tests/benches that still want mold linking.
+dev-gpu = { features = ["dev", "gpu"] }

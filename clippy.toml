@@ -1,0 +1,12 @@
+# Raw environment reads go through `eschalign_cli::env` so every switch parses
+# the same way (see crates/eschalign-cli/src/env.rs). A genuinely different
+# shape (a backend-name cap, a third-party convention variable) gets a narrow
+# `#[allow(clippy::disallowed_methods)]` with a one-line reason, not a blanket
+# allow.
+
+disallowed-methods = [
+    { path = "flate2::gz::read::GzDecoder::new", reason = "single-member decoder silently truncates bgzip/concatenated files; use flate2::read::MultiGzDecoder" },
+    { path = "std::env::var", reason = "use env::{flag, positive_usize} (crates/eschalign-cli/src/env.rs) for ESCHALIGN_* switches/knobs; allowed only there and for documented exceptions (*_BACKEND caps, third-party/cargo-provided vars)" },
+    { path = "std::env::var_os", reason = "use env::{flag, positive_usize} (crates/eschalign-cli/src/env.rs) for ESCHALIGN_* switches/knobs; allowed only there and for documented exceptions (*_BACKEND caps, third-party/cargo-provided vars)" },
+    { path = "noodles_bgzf::io::MultithreadedReader::new", reason = "one worker no matter the name; use with_worker_count sized from the rayon pool" },
+]
