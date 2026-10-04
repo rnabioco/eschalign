@@ -20,10 +20,19 @@ fn fixtures() -> PathBuf {
 
 const CONFIGS: &[(&str, &[&str])] = &[
     ("default", &[]),
-    ("semiglobal_both_secondary", &["--mode", "semiglobal", "--strand", "both", "--secondary"]),
+    (
+        "semiglobal_both_secondary",
+        &["--mode", "semiglobal", "--strand", "both", "--secondary"],
+    ),
     ("sort_coordinate", &["--sort", "coordinate"]),
-    ("min_score_max_ties", &["--min-score", "60", "--max-ties", "1"]),
-    ("scoring_bwa", &["--scoring", "1,-1,-2,-1", "--strand", "both"]),
+    (
+        "min_score_max_ties",
+        &["--min-score", "60", "--max-ties", "1"],
+    ),
+    (
+        "scoring_bwa",
+        &["--scoring", "1,-1,-2,-1", "--strand", "both"],
+    ),
     ("max_read_len", &["--max-read-len", "60"]),
 ];
 
@@ -79,7 +88,10 @@ fn unpaired_output_unchanged() {
         got.push_str(&format!("{label}\t{n}\t{h:016x}\n"));
     }
     let golden = fixtures().join("unpaired_golden.tsv");
-    if std::env::var_os("ESCHALIGN_BLESS").is_some() {
+    // A test-only switch, not a runtime knob: any value blesses.
+    #[allow(clippy::disallowed_methods)]
+    let bless = std::env::var_os("ESCHALIGN_BLESS").is_some();
+    if bless {
         std::fs::write(&golden, &got).unwrap();
         return;
     }

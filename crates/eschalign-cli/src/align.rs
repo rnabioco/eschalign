@@ -120,8 +120,8 @@ use sam::header::record::value::map::{self, Program, ReferenceSequence, program:
 use std::sync::Arc;
 
 use eschalign::{
-    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, Panel, ReadMapping, ScoreMatrix, Scoring,
-    sam as align_sam,
+    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, PairMapping, PairOptions, Panel, ReadMapping,
+    ScoreMatrix, Scoring, sam as align_sam,
 };
 use rayon::prelude::*;
 
@@ -133,8 +133,50 @@ pub struct AlignArgs {
     /// Reads: an unaligned BAM (dorado's uBAM), or FASTA/FASTQ, plain or gzip.
     /// Forward-strand aligned BAM records are accepted too; their alignment is
     /// discarded and they are aligned afresh
-    #[arg(value_name = "READS")]
-    pub reads: PathBuf,
+    #[arg(
+        value_name = "READS",
+        required_unless_present_all = ["r1", "r2"],
+        conflicts_with_all = ["r1", "r2"]
+    )]
+    pub reads: Option<PathBuf>,
+
+    /// Mate 1 FASTQ/FASTA (plain or gzip) of a read pair; needs `-2`. Mates
+    /// are matched by name, `/1` and `/2` stripped. Switches on paired-end
+    /// alignment
+    #[arg(short = '1', long = "r1", value_name = "FASTQ", requires = "r2")]
+    pub r1: Option<PathBuf>,
+
+    /// Mate 2 FASTQ/FASTA of a read pair; needs `-1`
+    #[arg(short = '2', long = "r2", value_name = "FASTQ", requires = "r1")]
+    pub r2: Option<PathBuf>,
+
+    /// READS is an interleaved FASTQ/FASTA: mate 1, mate 2, mate 1, … (a BAM's
+    /// pairing is read from its 0x1/0x40/0x80 flags instead)
+    #[arg(long, requires = "reads", conflicts_with_all = ["r1", "r2"])]
+    pub interleaved: bool,
+
+    /// Paired input only: the longest insert (leftmost to rightmost aligned
+    /// reference base of either mate) a proper pair may have [default: 500]
+    #[arg(long, value_name = "N")]
+    pub max_insert: Option<usize>,
+
+    /// Paired input only: mate 1's 3' adapter (its prefix is enough)
+    /// [default: TruSeq Read 1, AGATCGGAAGAGCACACGTCTGAACTCCAGTCA]
+    #[arg(long, value_name = "SEQ")]
+    pub adapter_r1: Option<String>,
+
+    /// Paired input only: mate 2's 3' adapter
+    /// [default: TruSeq Read 2, AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT]
+    #[arg(long, value_name = "SEQ")]
+    pub adapter_r2: Option<String>,
+
+    /// Paired input only: the shortest 3' match counted as adapter [default: 5]
+    #[arg(long, value_name = "N")]
+    pub min_adapter_overlap: Option<usize>,
+
+    /// Paired input only: do not look for 3' adapter read-through (no `ad` tag)
+    #[arg(long)]
+    pub no_adapter_trim: bool,
 
     /// Reference panel FASTA, plain or gzip
     #[arg(short, long, value_name = "FASTA")]
@@ -166,9 +208,10 @@ pub struct AlignArgs {
     pub tmp_dir: Option<PathBuf>,
 
     /// `local` (Smith-Waterman, overhangs soft-clipped) or `semiglobal`
-    /// (overlap: leading/trailing gaps of either sequence free)
-    #[arg(long, default_value = "local", value_parser = parse_mode, value_name = "MODE")]
-    pub mode: Mode,
+    /// (overlap: leading/trailing gaps of either sequence free) [default:
+    /// `local`; `semiglobal` for paired input, which keeps terminal mismatches]
+    #[arg(long, value_parser = parse_mode, value_name = "MODE")]
+    pub mode: Option<Mode>,
 
     /// MATCH,MISMATCH,GAP_OPEN,GAP_EXTEND. A gap of length k scores
     /// GAP_OPEN + (k-1)*GAP_EXTEND. bwa's `-A1 -B1 -O1 -E1` is `1,-1,-2,-1`
@@ -612,6 +655,323 @@ enum Source {
     Fastx(FastxReader),
 }
 
+/// What the reader thread will read: single reads, or read pairs.
+enum Input {
+    Single(Source),
+    Paired(PairSource),
+}
+
+// ---------------------------------------------------------------------------
+// Paired input
+// ---------------------------------------------------------------------------
+
+/// Where read pairs come from. Whichever it is, the reader hands over pairs
+/// as two adjacent records, mate 1 then mate 2.
+enum PairSource {
+    /// A BAM whose records carry 0x1 with 0x40 / 0x80, mates adjacent.
+    Bam(bam::io::Reader<bgzf::io::MultithreadedReader<File>>),
+    /// One FASTQ/FASTA, mate 1 then mate 2 for each pair.
+    Interleaved(FastxReader),
+    /// Two FASTQ/FASTA files, record `k` of each being a pair.
+    Files(Box<FastxReader>, Box<FastxReader>, [String; 2]),
+}
+
+/// A read name without a trailing `/1` or `/2` (the name both mates share).
+fn mate_stem(name: &[u8]) -> &[u8] {
+    match name {
+        [stem @ .., b'/', b'1' | b'2'] => stem,
+        _ => name,
+    }
+}
+
+fn show(name: &[u8]) -> String {
+    String::from_utf8_lossy(name).into_owned()
+}
+
+/// Whether a BAM holds read pairs: its first primary record is flagged
+/// paired (0x1) and as mate 1 or mate 2 (0x40 / 0x80).
+fn bam_is_paired(path: &Path) -> anyhow::Result<bool> {
+    let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut r = bam::io::Reader::new(f);
+    r.read_header()
+        .with_context(|| format!("reading BAM header of {}", path.display()))?;
+    let mut rec = bam::Record::default();
+    while r.read_record(&mut rec)? != 0 {
+        let flags = rec.flags();
+        if flags.is_secondary() || flags.is_supplementary() {
+            continue;
+        }
+        return Ok(flags.is_segmented() && (flags.is_first_segment() || flags.is_last_segment()));
+    }
+    Ok(false)
+}
+
+/// The next primary record of a BAM, with the same refusals as the unpaired
+/// reader (secondary/supplementary skipped and counted, reverse-strand
+/// alignments refused).
+fn next_primary(
+    r: &mut bam::io::Reader<bgzf::io::MultithreadedReader<File>>,
+    counts: &mut ReadCounts,
+) -> anyhow::Result<Option<bam::Record>> {
+    loop {
+        let mut rec = bam::Record::default();
+        if r.read_record(&mut rec)? == 0 {
+            return Ok(None);
+        }
+        let flags = rec.flags();
+        if flags.is_secondary() || flags.is_supplementary() {
+            counts.not_primary += 1;
+            continue;
+        }
+        if !flags.is_unmapped() && flags.is_reverse_complemented() {
+            bail!(
+                "input record {} is aligned to the reverse strand; `eschalign` takes \
+                 unaligned reads (or forward-strand alignments, whose SEQ is the read as \
+                 sequenced)",
+                rec.name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "*".into())
+            );
+        }
+        return Ok(Some(rec));
+    }
+}
+
+impl PairSource {
+    /// The next pair as `(mate 1, mate 2, shared name)`, or `None` at the end.
+    /// An orphan mate or a name mismatch is an error naming the read.
+    fn next_pair(
+        &mut self,
+        counts: &mut ReadCounts,
+    ) -> anyhow::Result<Option<(InRecord, InRecord, Vec<u8>)>> {
+        match self {
+            PairSource::Bam(r) => {
+                let Some(a) = next_primary(r, counts)? else {
+                    return Ok(None);
+                };
+                let name_a = a.name().map(|n| n.to_vec()).unwrap_or_default();
+                let fa = a.flags();
+                if !fa.is_segmented() || fa.is_first_segment() == fa.is_last_segment() {
+                    bail!(
+                        "read {}: not a mate (flags {}): paired input needs 0x1 with exactly \
+                         one of 0x40 / 0x80 on every record",
+                        show(&name_a),
+                        u16::from(fa)
+                    );
+                }
+                let Some(b) = next_primary(r, counts)? else {
+                    bail!("read {} has no mate: the BAM ends after it", show(&name_a));
+                };
+                let name_b = b.name().map(|n| n.to_vec()).unwrap_or_default();
+                let fb = b.flags();
+                if mate_stem(&name_a) != mate_stem(&name_b) {
+                    bail!(
+                        "read {} has no mate: the next record is {} (mates must be adjacent, \
+                         name-grouped)",
+                        show(&name_a),
+                        show(&name_b)
+                    );
+                }
+                if !fb.is_segmented()
+                    || fb.is_first_segment() == fb.is_last_segment()
+                    || fb.is_first_segment() == fa.is_first_segment()
+                {
+                    bail!(
+                        "read {}: the two records are not mate 1 and mate 2 (flags {} and {})",
+                        show(mate_stem(&name_a)),
+                        u16::from(fa),
+                        u16::from(fb)
+                    );
+                }
+                let stem = mate_stem(&name_a).to_vec();
+                let (r1, r2) = if fa.is_first_segment() {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                Ok(Some((InRecord::Bam(r1), InRecord::Bam(r2), stem)))
+            }
+            PairSource::Interleaved(r) => {
+                let Some((na, sa, qa)) = r.next_record()? else {
+                    return Ok(None);
+                };
+                let Some((nb, sb, qb)) = r.next_record()? else {
+                    bail!("read {} has no mate: the file ends after it", show(&na));
+                };
+                if mate_stem(&na) != mate_stem(&nb) {
+                    bail!(
+                        "read {} has no mate: the next record is {} (an interleaved file \
+                         alternates mate 1, mate 2)",
+                        show(&na),
+                        show(&nb)
+                    );
+                }
+                let stem = mate_stem(&na).to_vec();
+                Ok(Some((
+                    InRecord::Buf(fastx_to_record(stem.clone(), sa, qa)),
+                    InRecord::Buf(fastx_to_record(stem.clone(), sb, qb)),
+                    stem,
+                )))
+            }
+            PairSource::Files(f1, f2, names) => match (f1.next_record()?, f2.next_record()?) {
+                (None, None) => Ok(None),
+                (Some((n, ..)), None) => bail!(
+                    "read {} has no mate: {} ends before {}",
+                    show(&n),
+                    names[1],
+                    names[0]
+                ),
+                (None, Some((n, ..))) => bail!(
+                    "read {} has no mate: {} ends before {}",
+                    show(&n),
+                    names[0],
+                    names[1]
+                ),
+                (Some((na, sa, qa)), Some((nb, sb, qb))) => {
+                    if mate_stem(&na) != mate_stem(&nb) {
+                        bail!(
+                            "mate names differ: {} in {} but {} in {} at the same record",
+                            show(&na),
+                            names[0],
+                            show(&nb),
+                            names[1]
+                        );
+                    }
+                    let stem = mate_stem(&na).to_vec();
+                    Ok(Some((
+                        InRecord::Buf(fastx_to_record(stem.clone(), sa, qa)),
+                        InRecord::Buf(fastx_to_record(stem.clone(), sb, qb)),
+                        stem,
+                    )))
+                }
+            },
+        }
+    }
+}
+
+/// The reader thread's body for pairs: batches of whole pairs (mate 1, mate 2
+/// adjacent) until the end. `--read-ids` selects by pair name.
+fn read_pair_batches(
+    mut source: PairSource,
+    wanted: Option<HashSet<Vec<u8>>>,
+    batch_size: usize,
+    tx: SyncSender<Vec<InRecord>>,
+) -> anyhow::Result<ReadCounts> {
+    let mut counts = ReadCounts::default();
+    let mut batch = Vec::with_capacity(batch_size + 1);
+    while let Some((a, b, name)) = source.next_pair(&mut counts)? {
+        if let Some(w) = &wanted
+            && !w.contains(&canonical_read_name(&name))
+        {
+            counts.filtered += 2;
+            continue;
+        }
+        batch.push(a);
+        batch.push(b);
+        if batch.len() >= batch_size {
+            let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size + 1));
+            if tx.send(full).is_err() {
+                return Ok(counts);
+            }
+        }
+    }
+    if !batch.is_empty() {
+        let _ = tx.send(batch);
+    }
+    Ok(counts)
+}
+
+/// Paired-run settings, shared by the workers and the GPU thread.
+#[derive(Clone)]
+struct PairCfg {
+    max_insert: usize,
+    /// `None` under `--no-adapter-trim`.
+    adapters: Option<AdapterSet>,
+}
+
+#[derive(Clone)]
+struct AdapterSet {
+    r1: Vec<u8>,
+    r2: Vec<u8>,
+    min_overlap: usize,
+}
+
+impl AdapterSet {
+    fn config(&self) -> eschalign::adapter::AdapterConfig<'_> {
+        eschalign::adapter::AdapterConfig {
+            r1: &self.r1,
+            r2: &self.r2,
+            min_overlap: self.min_overlap,
+        }
+    }
+}
+
+/// Adapter bases at the 3' end of each mate of a pair. A mate over
+/// `--max-read-len` is not aligned and is not searched (0); the other mate is
+/// searched alone, since the two-mate agreement check needs both. One function
+/// for the workers and the GPU thread, so both trim the same bases.
+fn pair_adapters(l1: &[u8], l2: &[u8], cfg: &PairCfg, max_read_len: usize) -> [usize; 2] {
+    let Some(set) = &cfg.adapters else {
+        return [0, 0];
+    };
+    let (o1, o2) = (
+        over_limit(max_read_len, l1.len()),
+        over_limit(max_read_len, l2.len()),
+    );
+    let ac = set.config();
+    match (o1, o2) {
+        (false, false) => eschalign::adapter::detect_pair(l1, l2, &ac),
+        (false, true) => [eschalign::adapter::find(l1, ac.r1, ac.min_overlap), 0],
+        (true, false) => [0, eschalign::adapter::find(l2, ac.r2, ac.min_overlap)],
+        (true, true) => [0, 0],
+    }
+}
+
+/// The paired-run settings from the command line.
+fn pair_cfg_from(args: &AlignArgs) -> anyhow::Result<PairCfg> {
+    use eschalign::adapter::{DEFAULT_MIN_OVERLAP, TRUSEQ_R1, TRUSEQ_R2};
+    let adapters = if args.no_adapter_trim {
+        if args.adapter_r1.is_some()
+            || args.adapter_r2.is_some()
+            || args.min_adapter_overlap.is_some()
+        {
+            bail!("--no-adapter-trim contradicts --adapter-r1/--adapter-r2/--min-adapter-overlap");
+        }
+        None
+    } else {
+        let r1 = match &args.adapter_r1 {
+            Some(a) => parse_adapter("--adapter-r1", a)?,
+            None => TRUSEQ_R1.to_vec(),
+        };
+        let r2 = match &args.adapter_r2 {
+            Some(a) => parse_adapter("--adapter-r2", a)?,
+            None => TRUSEQ_R2.to_vec(),
+        };
+        let min_overlap = args.min_adapter_overlap.unwrap_or(DEFAULT_MIN_OVERLAP);
+        if min_overlap == 0 {
+            bail!("--min-adapter-overlap must be at least 1");
+        }
+        Some(AdapterSet {
+            r1,
+            r2,
+            min_overlap,
+        })
+    };
+    Ok(PairCfg {
+        max_insert: args.max_insert.unwrap_or(500),
+        adapters,
+    })
+}
+
+/// One adapter sequence from the command line: A/C/G/T/U/N, any case.
+fn parse_adapter(flag: &str, s: &str) -> anyhow::Result<Vec<u8>> {
+    let seq: Vec<u8> = s.trim().bytes().map(|b| b.to_ascii_uppercase()).collect();
+    if seq.is_empty() || !seq.iter().all(|b| b"ACGTUN".contains(b)) {
+        bail!("{flag}: {s:?} is not a nucleotide sequence (A, C, G, T/U, N)");
+    }
+    Ok(seq)
+}
+
 // ---------------------------------------------------------------------------
 // Output records
 // ---------------------------------------------------------------------------
@@ -634,10 +994,26 @@ fn int_value(v: i64) -> Value {
 }
 
 fn sam_cigar(hit: &Hit, read_len: usize) -> sam::alignment::record_buf::Cigar {
+    sam_cigar_ad(hit, read_len, 0)
+}
+
+/// Where a hit's aligned part sits in the full SEQ as written: the alignment
+/// is on the mate *without* its `ad` adapter bases, which are the mate's 3'
+/// end — the end of SEQ for a forward hit, the start for a reverse one.
+fn clipped_span(hit: &Hit, ad: usize) -> (usize, usize) {
     let a = &hit.alignment;
+    let shift = if hit.reverse { ad } else { 0 };
+    (a.query_start + shift, a.query_end + shift)
+}
+
+/// [`sam_cigar`] for a read whose last `ad` 3' bases were not aligned and are
+/// soft-clipped (`ad = 0`: the plain unpaired CIGAR).
+fn sam_cigar_ad(hit: &Hit, read_len: usize, ad: usize) -> sam::alignment::record_buf::Cigar {
+    let a = &hit.alignment;
+    let (qs, qe) = clipped_span(hit, ad);
     let mut ops = Vec::with_capacity(a.ops.len() + 2);
-    if a.query_start > 0 {
-        ops.push(Op::new(Kind::SoftClip, a.query_start));
+    if qs > 0 {
+        ops.push(Op::new(Kind::SoftClip, qs));
     }
     for &(op, len) in &a.ops {
         let kind = match op {
@@ -647,21 +1023,26 @@ fn sam_cigar(hit: &Hit, read_len: usize) -> sam::alignment::record_buf::Cigar {
         };
         ops.push(Op::new(kind, len as usize));
     }
-    if read_len > a.query_end {
-        ops.push(Op::new(Kind::SoftClip, read_len - a.query_end));
+    if read_len > qe {
+        ops.push(Op::new(Kind::SoftClip, read_len - qe));
     }
     ops.into()
 }
 
 /// bwa's `XA:Z:` entry: `ref,±pos,CIGAR,NM;`.
 fn xa_entry(panel: &Panel, hit: &Hit, read_len: usize) -> String {
+    xa_entry_ad(panel, hit, read_len, 0)
+}
+
+fn xa_entry_ad(panel: &Panel, hit: &Hit, read_len: usize, ad: usize) -> String {
     let a = &hit.alignment;
+    let (qs, qe) = clipped_span(hit, ad);
     format!(
         "{},{}{},{},{};",
         panel.get(hit.reference).name,
         if hit.reverse { '-' } else { '+' },
         a.ref_start + 1,
-        align_sam::cigar_string(&a.ops, read_len, a.query_start, a.query_end),
+        align_sam::cigar_string(&a.ops, read_len, qs, qe),
         hit.nm
     )
 }
@@ -781,6 +1162,230 @@ fn build_records(
     )
 }
 
+/// Tags a paired run owns besides [`OWNED_TAGS`]: the mate's CIGAR and the
+/// adapter length.
+const MC_TAG: Tag = Tag::new(b'M', b'C');
+const AD_TAG: Tag = Tag::new(b'a', b'd');
+
+/// How one mate was placed, however its pair resolved.
+struct MatePlacement<'a> {
+    /// `None`: the mate is unmapped.
+    primary: Option<&'a Hit>,
+    /// The mate's hit in every other tie-set member (`XA`, `--secondary`).
+    others: Vec<&'a Hit>,
+    /// Beside each of `others`, the partner's hit it belongs to: in a proper
+    /// pair the other mate at the same tie-set member, otherwise the
+    /// partner's primary.
+    partners: Vec<Option<&'a Hit>>,
+    /// `AS` of the primary.
+    score: i32,
+    xs: Option<i32>,
+    /// MAPQ 60 (a unique best reference) rather than 0.
+    unique: bool,
+}
+
+/// `TLEN` of `hit` against its partner: the span from the leftmost aligned
+/// base of either to the rightmost, positive for the leftmost mate (mate 1
+/// when both start together) and negative for the other.
+fn template_length(hit: &Hit, partner: &Hit, first: bool) -> i32 {
+    let (a, b) = (&hit.alignment, &partner.alignment);
+    let len = a.ref_end.max(b.ref_end) - a.ref_start.min(b.ref_start);
+    let left = a.ref_start < b.ref_start || (a.ref_start == b.ref_start && first);
+    let len = i32::try_from(len).unwrap_or(i32::MAX);
+    if left { len } else { -len }
+}
+
+/// Rewrite a read pair's two input records into its output records: the two
+/// primaries (mate 1, mate 2) and, with `--secondary`, one secondary per mate
+/// per further tie-set member. `ad` is `Some` when adapters were searched for
+/// (it carries each mate's `ad:i`).
+fn build_pair_records(
+    mut recs: [RecordBuf; 2],
+    mates: &[MatePlacement<'_>; 2],
+    proper: bool,
+    ad: Option<[usize; 2]>,
+    panel: &Panel,
+    secondary: bool,
+) -> ([RecordBuf; 2], Vec<RecordBuf>, [Outcome; 2]) {
+    let full = [recs[0].sequence().len(), recs[1].sequence().len()];
+    let adn = ad.unwrap_or([0, 0]);
+    let seg = [Flags::FIRST_SEGMENT, Flags::LAST_SEGMENT];
+    let mut flags = [Flags::empty(); 2];
+    let mut kept = [Flags::empty(); 2];
+
+    // Each mate on its own: strand, position, CIGAR, alignment tags.
+    for m in 0..2 {
+        let rec = &mut recs[m];
+        kept[m] = rec.flags() & (Flags::QC_FAIL | Flags::DUPLICATE);
+        for t in OWNED_TAGS.iter().chain([&MC_TAG, &AD_TAG]) {
+            rec.data_mut().remove(t);
+        }
+        *rec.mate_reference_sequence_id_mut() = None;
+        *rec.mate_alignment_start_mut() = None;
+        *rec.template_length_mut() = 0;
+        flags[m] = kept[m] | Flags::SEGMENTED | seg[m];
+        let place = &mates[m];
+        match place.primary {
+            None => {
+                flags[m] |= Flags::UNMAPPED;
+                *rec.reference_sequence_id_mut() = None;
+                *rec.alignment_start_mut() = None;
+                *rec.mapping_quality_mut() = MappingQuality::new(0);
+                *rec.cigar_mut() = Default::default();
+            }
+            Some(h) => {
+                if h.reverse {
+                    flags[m] |= Flags::REVERSE_COMPLEMENTED;
+                    let rc = eschalign::alphabet::reverse_complement(rec.sequence().as_ref());
+                    *rec.sequence_mut() = rc.into();
+                    let mut q: Vec<u8> = rec.quality_scores().as_ref().to_vec();
+                    q.reverse();
+                    *rec.quality_scores_mut() = q.into();
+                }
+                *rec.reference_sequence_id_mut() = Some(h.reference);
+                *rec.alignment_start_mut() = Some(position(h.alignment.ref_start));
+                *rec.mapping_quality_mut() = MappingQuality::new(if place.unique { 60 } else { 0 });
+                *rec.cigar_mut() = sam_cigar_ad(h, full[m], adn[m]);
+                let data = rec.data_mut();
+                data.insert(Tag::EDIT_DISTANCE, int_value(h.nm as i64));
+                data.insert(
+                    Tag::MISMATCHED_POSITIONS,
+                    Value::String(h.md.clone().into()),
+                );
+                data.insert(Tag::ALIGNMENT_SCORE, int_value(place.score as i64));
+                if let Some(xs) = place.xs {
+                    data.insert(Tag::new(b'X', b'S'), int_value(xs as i64));
+                }
+                if !place.others.is_empty() {
+                    let xa: String = place
+                        .others
+                        .iter()
+                        .map(|o| xa_entry_ad(panel, o, full[m], adn[m]))
+                        .collect();
+                    data.insert(Tag::new(b'X', b'A'), Value::String(xa.into()));
+                }
+            }
+        }
+        if let Some(a) = ad {
+            rec.data_mut().insert(AD_TAG, int_value(a[m] as i64));
+        }
+    }
+
+    // Each mate against its partner: the mate fields.
+    let primaries = [mates[0].primary, mates[1].primary];
+    for m in 0..2 {
+        let o = 1 - m;
+        let rec = &mut recs[m];
+        match (primaries[m], primaries[o]) {
+            (Some(h), Some(oh)) => {
+                if oh.reverse {
+                    flags[m] |= Flags::MATE_REVERSE_COMPLEMENTED;
+                }
+                if proper {
+                    flags[m] |= Flags::PROPERLY_SEGMENTED;
+                }
+                *rec.mate_reference_sequence_id_mut() = Some(oh.reference);
+                *rec.mate_alignment_start_mut() = Some(position(oh.alignment.ref_start));
+                let mc = align_sam::cigar_string(
+                    &oh.alignment.ops,
+                    full[o],
+                    clipped_span(oh, adn[o]).0,
+                    clipped_span(oh, adn[o]).1,
+                );
+                rec.data_mut().insert(MC_TAG, Value::String(mc.into()));
+                if h.reference == oh.reference {
+                    *rec.template_length_mut() = template_length(h, oh, m == 0);
+                }
+            }
+            (Some(h), None) => {
+                flags[m] |= Flags::MATE_UNMAPPED;
+                *rec.mate_reference_sequence_id_mut() = Some(h.reference);
+                *rec.mate_alignment_start_mut() = Some(position(h.alignment.ref_start));
+            }
+            (None, Some(oh)) => {
+                // An unmapped mate sits at its partner's position, as samtools
+                // writes it.
+                if oh.reverse {
+                    flags[m] |= Flags::MATE_REVERSE_COMPLEMENTED;
+                }
+                *rec.reference_sequence_id_mut() = Some(oh.reference);
+                *rec.alignment_start_mut() = Some(position(oh.alignment.ref_start));
+                *rec.mate_reference_sequence_id_mut() = Some(oh.reference);
+                *rec.mate_alignment_start_mut() = Some(position(oh.alignment.ref_start));
+            }
+            (None, None) => flags[m] |= Flags::MATE_UNMAPPED,
+        }
+        *rec.flags_mut() = flags[m];
+    }
+
+    // --secondary: each further tie-set member as a pair of 0x100 records,
+    // mate 1's then mate 2's, in tie order.
+    let mut secs = Vec::new();
+    if secondary {
+        let n_ties = mates[0].others.len().max(mates[1].others.len());
+        for k in 0..n_ties {
+            for m in 0..2 {
+                let Some(&h) = mates[m].others.get(k) else {
+                    continue;
+                };
+                let partner = mates[m].partners[k];
+                let mut f = Flags::SECONDARY | Flags::SEGMENTED | seg[m] | kept[m];
+                if h.reverse {
+                    f |= Flags::REVERSE_COMPLEMENTED;
+                }
+                let mut d = sam::alignment::record_buf::Data::default();
+                d.insert(Tag::EDIT_DISTANCE, int_value(h.nm as i64));
+                d.insert(
+                    Tag::MISMATCHED_POSITIONS,
+                    Value::String(h.md.clone().into()),
+                );
+                d.insert(Tag::ALIGNMENT_SCORE, int_value(h.alignment.score as i64));
+                if let Some(rg) = recs[m].data().get(&Tag::READ_GROUP) {
+                    d.insert(Tag::READ_GROUP, rg.clone());
+                }
+                let mut b = RecordBuf::builder()
+                    .set_reference_sequence_id(h.reference)
+                    .set_alignment_start(position(h.alignment.ref_start))
+                    .set_mapping_quality(MappingQuality::new(0).expect("0 is a valid MAPQ"))
+                    .set_cigar(sam_cigar_ad(h, full[m], adn[m]));
+                match partner {
+                    Some(ph) => {
+                        if ph.reverse {
+                            f |= Flags::MATE_REVERSE_COMPLEMENTED;
+                        }
+                        b = b
+                            .set_mate_reference_sequence_id(ph.reference)
+                            .set_mate_alignment_start(position(ph.alignment.ref_start));
+                        if proper {
+                            f |= Flags::PROPERLY_SEGMENTED;
+                            if ph.reference == h.reference {
+                                b = b.set_template_length(template_length(h, ph, m == 0));
+                            }
+                        }
+                    }
+                    None => {
+                        f |= Flags::MATE_UNMAPPED;
+                        b = b
+                            .set_mate_reference_sequence_id(h.reference)
+                            .set_mate_alignment_start(position(h.alignment.ref_start));
+                    }
+                }
+                b = b.set_flags(f).set_data(d);
+                if let Some(n) = recs[m].name() {
+                    b = b.set_name(n.to_vec());
+                }
+                secs.push(b.build());
+            }
+        }
+    }
+    let outcome = |m: usize| match mates[m].primary {
+        None => Outcome::Unmapped,
+        Some(_) if mates[m].unique => Outcome::Unique,
+        Some(_) => Outcome::Tied,
+    };
+    (recs, secs, [outcome(0), outcome(1)])
+}
+
 /// Everything a worker needs, shared read-only across the pool.
 struct Job<'a> {
     aligner: &'a Aligner,
@@ -797,6 +1402,11 @@ struct Job<'a> {
     max_read_len: usize,
     /// Reads written unmapped for `--max-read-len`.
     skipped_long: AtomicU64,
+    /// `Some` for a paired run: the chunks hold read pairs.
+    pair: Option<PairCfg>,
+    /// Read pairs seen, and of those how many resolved as proper pairs.
+    pairs: AtomicU64,
+    proper_pairs: AtomicU64,
 }
 
 /// Whether `--max-read-len` keeps a read of `len` bases out of alignment.
@@ -937,6 +1547,136 @@ fn process_chunk(
         .collect()
 }
 
+/// A chunk of read pairs (mate 1, mate 2 adjacent), start to finish on a
+/// worker: decode, find adapters, align each pair as a pair, rewrite, encode.
+fn process_pair_chunk(
+    ctx: &Job<'_>,
+    cfg: &PairCfg,
+    chunk: Vec<InRecord>,
+    scores: ChunkScores,
+) -> anyhow::Result<Encoded> {
+    let mut records = chunk
+        .into_iter()
+        .map(|rec| match rec {
+            InRecord::Bam(raw) => Ok(RecordBuf::try_from_alignment_record(ctx.in_header, &raw)?),
+            InRecord::Buf(r) => Ok(r),
+        })
+        .collect::<anyhow::Result<Vec<RecordBuf>>>()?;
+    anyhow::ensure!(
+        records.len().is_multiple_of(2),
+        "a chunk of pairs has an odd record count"
+    );
+    // Both mates share one name, without any /1 or /2.
+    for r in &mut records {
+        if let Some(n) = r.name() {
+            let stem = mate_stem(n.as_ref());
+            if stem.len() != n.len() {
+                *r.name_mut() = Some(stem.to_vec().into());
+            }
+        }
+    }
+    let n = records.len() / 2;
+    let max = ctx.max_read_len;
+    let seq = |k: usize| -> &[u8] { records[k].sequence().as_ref() };
+    let ads: Vec<[usize; 2]> = (0..n)
+        .map(|i| pair_adapters(seq(2 * i), seq(2 * i + 1), cfg, max))
+        .collect();
+    // What is aligned: each mate less its 3' adapter; a mate over
+    // --max-read-len is not aligned at all (and the other is mapped alone).
+    let mut skipped = 0u64;
+    let trimmed: Vec<[&[u8]; 2]> = (0..n)
+        .map(|i| {
+            [0, 1].map(|m| {
+                let s = seq(2 * i + m);
+                if over_limit(max, s.len()) {
+                    skipped += 1;
+                    &s[..0]
+                } else {
+                    &s[..s.len() - ads[i][m]]
+                }
+            })
+        })
+        .collect();
+    if skipped > 0 {
+        ctx.skipped_long.fetch_add(skipped, Ordering::Relaxed);
+    }
+    let popts = PairOptions {
+        min_score: ctx.opts.min_score,
+        max_ties: ctx.opts.max_ties,
+        max_insert: cfg.max_insert,
+        both_strands: ctx.opts.both_strands,
+    };
+    let mappings = ctx
+        .aligner
+        .map_pairs_scored(&trimmed, &popts, |i, m, reverse| {
+            scores
+                .as_ref()
+                .and_then(|(batch, first)| batch.row(first + 2 * i + m, reverse))
+        });
+    drop(trimmed);
+    ctx.pairs.fetch_add(n as u64, Ordering::Relaxed);
+    let mut out: Encoded = Vec::with_capacity(records.len());
+    let mut recs = records.into_iter();
+    for (mapping, ad) in mappings.iter().zip(&ads) {
+        let pair = [recs.next().expect("mate 1"), recs.next().expect("mate 2")];
+        let (placements, proper) = match mapping {
+            PairMapping::Proper {
+                n_tied,
+                suboptimal,
+                hits,
+                ..
+            } => {
+                let place = |m: usize| MatePlacement {
+                    primary: Some(&hits[0].mates[m]),
+                    others: hits[1..].iter().map(|h| &h.mates[m]).collect(),
+                    partners: hits[1..].iter().map(|h| Some(&h.mates[1 - m])).collect(),
+                    score: hits[0].mates[m].alignment.score,
+                    xs: suboptimal[m],
+                    unique: *n_tied == 1,
+                };
+                ctx.proper_pairs.fetch_add(1, Ordering::Relaxed);
+                ([place(0), place(1)], true)
+            }
+            PairMapping::Separate(ms) => {
+                let place = |m: usize| {
+                    let me = &ms[m];
+                    let others: Vec<&Hit> = me.hits.iter().skip(1).collect();
+                    MatePlacement {
+                        partners: vec![ms[1 - m].primary(); others.len()],
+                        others,
+                        primary: me.primary(),
+                        score: me.best_score.unwrap_or(0),
+                        xs: me.suboptimal,
+                        unique: me.n_tied == 1,
+                    }
+                };
+                ([place(0), place(1)], false)
+            }
+        };
+        let (prim, secs, outcomes) = build_pair_records(
+            pair,
+            &placements,
+            proper,
+            cfg.adapters.is_some().then_some(*ad),
+            ctx.aligner.panel(),
+            ctx.secondary,
+        );
+        let encode = |recs: &[&RecordBuf]| -> anyhow::Result<Vec<u8>> {
+            let mut w = bam::io::Writer::from(Vec::with_capacity(8 << 10));
+            for r in recs {
+                w.write_alignment_record(ctx.out_header, *r)?;
+            }
+            Ok(w.into_inner())
+        };
+        let [r1, r2] = &prim;
+        out.push((encode(&[r1])?, outcomes[0]));
+        let mut tail: Vec<&RecordBuf> = vec![r2];
+        tail.extend(secs.iter());
+        out.push((encode(&tail)?, outcomes[1]));
+    }
+    Ok(out)
+}
+
 /// One read strand's panel scores (codes in), computed one lane group per
 /// rayon task — the row `Aligner::score_all` would give, as `i16` for
 /// `map_reads_scored`. `None` outside the `i16` bound, where the aligner's
@@ -1022,6 +1762,120 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         bail!("--batch-size must be at least 1");
     }
 
+    // --- Input -------------------------------------------------------------
+    let wanted = args.read_ids.as_deref().map(load_read_ids).transpose()?;
+    if let Some(w) = &wanted {
+        info!(
+            "aligning only the {} reads named in --read-ids",
+            style::count(w.len())
+        );
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let open_bam = |path: &Path| -> anyhow::Result<(_, sam::Header)> {
+        let workers = std::num::NonZero::new(threads.div_ceil(4)).expect("at least one");
+        let file = File::open(path)?;
+        let mut r = bam::io::Reader::from(bgzf::io::MultithreadedReader::with_worker_count(
+            workers, file,
+        ));
+        let h = r
+            .read_header()
+            .with_context(|| format!("reading BAM header of {}", path.display()))?;
+        Ok((r, h))
+    };
+    let open_fastx = |path: &Path| -> anyhow::Result<FastxReader> {
+        match sniff(path)? {
+            InputFormat::Fasta => Ok(FastxReader::new(open_text(path)?, false)),
+            InputFormat::Fastq => Ok(FastxReader::new(open_text(path)?, true)),
+            InputFormat::Bam => bail!(
+                "{}: a BAM cannot be a mate file; pass a paired BAM as READS",
+                path.display()
+            ),
+        }
+    };
+    let mut in_header = sam::Header::default();
+    let input = if let (Some(r1), Some(r2)) = (&args.r1, &args.r2) {
+        let names = [r1.display().to_string(), r2.display().to_string()];
+        Input::Paired(PairSource::Files(
+            Box::new(open_fastx(r1)?),
+            Box::new(open_fastx(r2)?),
+            names,
+        ))
+    } else {
+        let reads = args.reads.as_deref().expect("clap requires READS or -1/-2");
+        match sniff(reads)? {
+            InputFormat::Bam => {
+                if args.interleaved {
+                    bail!(
+                        "--interleaved applies to FASTA/FASTQ; a BAM's pairing is read from \
+                         its 0x1/0x40/0x80 flags"
+                    );
+                }
+                let paired = bam_is_paired(reads)?;
+                let (r, h) = open_bam(reads)?;
+                in_header = h;
+                if paired {
+                    Input::Paired(PairSource::Bam(r))
+                } else {
+                    Input::Single(Source::Bam(r))
+                }
+            }
+            InputFormat::Fasta | InputFormat::Fastq if args.interleaved => {
+                Input::Paired(PairSource::Interleaved(open_fastx(reads)?))
+            }
+            InputFormat::Fasta => {
+                Input::Single(Source::Fastx(FastxReader::new(open_text(reads)?, false)))
+            }
+            InputFormat::Fastq => {
+                Input::Single(Source::Fastx(FastxReader::new(open_text(reads)?, true)))
+            }
+        }
+    };
+    let paired = matches!(input, Input::Paired(_));
+    let pair_cfg = if paired {
+        Some(pair_cfg_from(&args)?)
+    } else {
+        let given = [
+            ("--max-insert", args.max_insert.is_some()),
+            ("--adapter-r1", args.adapter_r1.is_some()),
+            ("--adapter-r2", args.adapter_r2.is_some()),
+            ("--min-adapter-overlap", args.min_adapter_overlap.is_some()),
+            ("--no-adapter-trim", args.no_adapter_trim),
+        ];
+        let named: Vec<&str> = given.iter().filter(|g| g.1).map(|g| g.0).collect();
+        if !named.is_empty() {
+            warn!(
+                "{} only apply to paired input (-1/-2, --interleaved, or a BAM of 0x40/0x80 \
+                 mates); this input is unpaired, so they are ignored",
+                named.join(", ")
+            );
+        }
+        None
+    };
+    // Paired input aligns end to end on the reference by default, so a
+    // mismatch at a read end stays a mismatch; `local` would clip it.
+    let mode = args.mode.unwrap_or(if paired {
+        Mode::SemiGlobal
+    } else {
+        Mode::Local
+    });
+    if paired {
+        info!(
+            "paired-end: {} mode, max insert {}, adapters {}",
+            mode.name(),
+            pair_cfg.as_ref().map_or(0, |c| c.max_insert),
+            match pair_cfg.as_ref().and_then(|c| c.adapters.as_ref()) {
+                Some(a) => format!("searched (min overlap {})", a.min_overlap),
+                None => "not searched (--no-adapter-trim)".to_string(),
+            }
+        );
+        if mode == Mode::Local {
+            warn!(
+                "--mode local soft-clips mismatches near a read end, which erases the \
+                 misincorporation and RT-stop signal paired mode is meant to keep"
+            );
+        }
+    }
+
     // --- Reference panel + kernel ------------------------------------------
     let panel = load_reference(&args.reference)?;
     info!(
@@ -1046,7 +1900,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     }
     let row_major_only =
         crate::env::flag_with_alias(ROW_MAJOR_ONLY_ENV, ROW_MAJOR_ONLY_ENV_DEPRECATED);
-    let mut aligner = Aligner::new(panel, args.scoring, args.mode)?;
+    let mut aligner = Aligner::new(panel, args.scoring, mode)?;
     if row_major_only {
         aligner = aligner.with_transposed_min_len(None);
         info!(
@@ -1056,7 +1910,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     }
     info!(
         "{} mode, scoring {} (match,mismatch,gap_open,gap_extend), {} strand{}, kernel {} ({} lanes)",
-        args.mode.name(),
+        mode.name(),
         args.scoring,
         match args.strand {
             StrandArg::Forward => "forward",
@@ -1081,36 +1935,6 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         None
     };
 
-    // --- Input -------------------------------------------------------------
-    let wanted = args.read_ids.as_deref().map(load_read_ids).transpose()?;
-    if let Some(w) = &wanted {
-        info!(
-            "aligning only the {} reads named in --read-ids",
-            style::count(w.len())
-        );
-    }
-    let threads = rayon::current_num_threads().max(1);
-    let (source, in_header) = match sniff(&args.reads)? {
-        InputFormat::Bam => {
-            let workers = std::num::NonZero::new(threads.div_ceil(4)).expect("at least one");
-            let file = File::open(&args.reads)?;
-            let mut r = bam::io::Reader::from(bgzf::io::MultithreadedReader::with_worker_count(
-                workers, file,
-            ));
-            let h = r
-                .read_header()
-                .with_context(|| format!("reading BAM header of {}", args.reads.display()))?;
-            (Source::Bam(r), h)
-        }
-        InputFormat::Fasta => (
-            Source::Fastx(FastxReader::new(open_text(&args.reads)?, false)),
-            sam::Header::default(),
-        ),
-        InputFormat::Fastq => (
-            Source::Fastx(FastxReader::new(open_text(&args.reads)?, true)),
-            sam::Header::default(),
-        ),
-    };
     let out_header = build_header(aligner.panel(), &in_header, args.sort)?;
 
     // --- Output ------------------------------------------------------------
@@ -1170,18 +1994,26 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     let batch_size = args.batch_size;
     let reader = std::thread::Builder::new()
         .name("eschalign-reader".into())
-        .spawn(move || read_batches(source, wanted, batch_size, in_tx))?;
+        .spawn(move || match input {
+            Input::Single(source) => read_batches(source, wanted, batch_size, in_tx),
+            Input::Paired(source) => read_pair_batches(source, wanted, batch_size, in_tx),
+        })?;
     // With a GPU, its thread sits between the reader and the dispatcher; the
     // channel after it is as shallow as the one before, for the same memory
     // bound.
     let (batches, gpu_thread): (Box<dyn Iterator<Item = Batch>>, _) = match gpu_scorer {
         Some(scorer) => {
             let (tx, rx) = sync_channel::<Batch>(2);
-            let both = opts.both_strands;
+            // A pair's fallback maps each mate on either strand, so a paired
+            // run always scores both orientations of every mate.
+            let both = opts.both_strands || paired;
             let max_read_len = args.max_read_len;
+            let gpu_pair = pair_cfg.clone();
             let t = std::thread::Builder::new()
                 .name("eschalign-gpu".into())
-                .spawn(move || gpu::score_batches(scorer, in_rx, tx, both, max_read_len))?;
+                .spawn(move || {
+                    gpu::score_batches(scorer, in_rx, tx, both, max_read_len, gpu_pair)
+                })?;
             (Box::new(rx.into_iter()), Some(t))
         }
         None => (Box::new(in_rx.into_iter().map(|b| (b, None))), None),
@@ -1204,6 +2036,9 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         split_strands: AtomicU64::new(0),
         max_read_len: args.max_read_len,
         skipped_long: AtomicU64::new(0),
+        pair: pair_cfg,
+        pairs: AtomicU64::new(0),
+        proper_pairs: AtomicU64::new(0),
     };
     let busy = dispatch(&ctx, batches, res_tx, permit_rx);
     // Join every thread before deciding which error to report: a failed stage
@@ -1238,7 +2073,12 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         );
     }
     let summary = write_result.with_context(|| format!("writing {}", args.output.display()))?;
-    let counts = read_result.with_context(|| format!("reading {}", args.reads.display()))?;
+    let input_name = args
+        .reads
+        .as_deref()
+        .or(args.r1.as_deref())
+        .map_or_else(String::new, |p| p.display().to_string());
+    let counts = read_result.with_context(|| format!("reading {input_name}"))?;
     let skipped_long = ctx.skipped_long.load(Ordering::Relaxed);
     debug!(
         "workers were busy {:.1} s of {:.1} s x {} threads; {} read strands of {}+ nt \
@@ -1271,6 +2111,19 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
             args.max_read_len
         );
     }
+    if paired {
+        let (pairs, proper) = (
+            ctx.pairs.load(Ordering::Relaxed),
+            ctx.proper_pairs.load(Ordering::Relaxed),
+        );
+        info!(
+            "{} read pairs: {} proper ({:.1}%), {} not",
+            style::count(pairs),
+            style::count(proper),
+            100.0 * proper as f64 / pairs.max(1) as f64,
+            style::count(pairs - proper),
+        );
+    }
     let wall = started.elapsed().as_secs_f64();
     let mapped = summary.unique + summary.tied;
     let pct = |n: u64| 100.0 * n as f64 / summary.reads.max(1) as f64;
@@ -1295,21 +2148,36 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
 /// bases, whichever comes first — so a read of hundreds of kilobases (they
 /// occur: up to ~400 kb in a real tRNA sample) is a chunk of its own rather
 /// than the tail that sixty-three short reads wait behind.
-fn cut_chunks(batch: Vec<InRecord>) -> Vec<Vec<InRecord>> {
+///
+/// With `paired`, the batch is mate 1, mate 2, mate 1, … and the two mates of
+/// a pair are one unit: a cut never falls between them, so a pair is always
+/// aligned, and its records written, by one worker.
+fn cut_chunks(batch: Vec<InRecord>, paired: bool) -> Vec<Vec<InRecord>> {
+    let len_of = |rec: &InRecord| match rec {
+        InRecord::Bam(r) => r.sequence().len(),
+        InRecord::Buf(r) => r.sequence().len(),
+    };
+    let unit = if paired { 2 } else { 1 };
+    debug_assert!(
+        batch.len().is_multiple_of(unit),
+        "a paired batch holds whole pairs"
+    );
     let mut chunks = Vec::new();
     let mut cur = Vec::with_capacity(CHUNK);
     let mut bases = 0usize;
-    for rec in batch {
-        let len = match &rec {
-            InRecord::Bam(r) => r.sequence().len(),
-            InRecord::Buf(r) => r.sequence().len(),
-        };
+    let mut it = batch.into_iter();
+    loop {
+        let group: Vec<InRecord> = it.by_ref().take(unit).collect();
+        if group.is_empty() {
+            break;
+        }
+        let len: usize = group.iter().map(len_of).sum();
         if !cur.is_empty() && (cur.len() >= CHUNK || bases + len > CHUNK_BASES) {
             chunks.push(std::mem::replace(&mut cur, Vec::with_capacity(CHUNK)));
             bases = 0;
         }
         bases += len;
-        cur.push(rec);
+        cur.extend(group);
     }
     if !cur.is_empty() {
         chunks.push(cur);
@@ -1340,7 +2208,7 @@ fn dispatch(
         let mut seq = 0u64;
         'batches: for (batch, scores) in batches {
             let mut first = 0usize;
-            for chunk in cut_chunks(batch) {
+            for chunk in cut_chunks(batch, ctx.pair.is_some()) {
                 if permit_rx.recv().is_err() {
                     // The writer stopped; its error is reported after the join.
                     break 'batches;
@@ -1352,7 +2220,10 @@ fn dispatch(
                 let this = seq;
                 scope.spawn(move |_| {
                     let t0 = Instant::now();
-                    let r = process_chunk(ctx, chunk, chunk_scores);
+                    let r = match &ctx.pair {
+                        Some(cfg) => process_pair_chunk(ctx, cfg, chunk, chunk_scores),
+                        None => process_chunk(ctx, chunk, chunk_scores),
+                    };
                     busy_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let _ = tx.send((this, r));
                 });
@@ -1823,6 +2694,7 @@ mod gpu {
         tx: SyncSender<Batch>,
         both_strands: bool,
         max_read_len: usize,
+        pair: Option<PairCfg>,
     ) -> anyhow::Result<GpuStats> {
         use eschalign::alphabet::{encode_base, reverse_complement_codes};
         let mut stats = GpuStats {
@@ -1845,17 +2717,41 @@ mod gpu {
                 // A read over --max-read-len goes as an empty query, which
                 // the kernel leaves unscored; the worker never asks for it.
                 let mut skipped = 0u64;
-                let mut codes: Vec<Vec<u8>> = batch
-                    .iter()
-                    .map(|rec| {
-                        letters(rec, &mut buf);
-                        if over_limit(max_read_len, buf.len()) {
-                            skipped += 1;
-                            return Vec::new();
+                let mut codes: Vec<Vec<u8>> = match &pair {
+                    None => batch
+                        .iter()
+                        .map(|rec| {
+                            letters(rec, &mut buf);
+                            if over_limit(max_read_len, buf.len()) {
+                                skipped += 1;
+                                return Vec::new();
+                            }
+                            buf.iter().map(|&b| encode_base(b)).collect()
+                        })
+                        .collect(),
+                    // Pairs: the aligned bases are each mate less its 3'
+                    // adapter, found by the same function the workers use.
+                    Some(cfg) => {
+                        let mut buf2 = Vec::new();
+                        let mut codes = Vec::with_capacity(batch.len());
+                        for mates in batch.chunks(2) {
+                            letters(&mates[0], &mut buf);
+                            letters(&mates[1], &mut buf2);
+                            let ad = pair_adapters(&buf, &buf2, cfg, max_read_len);
+                            for (l, ad) in [(&buf, ad[0]), (&buf2, ad[1])] {
+                                if over_limit(max_read_len, l.len()) {
+                                    skipped += 1;
+                                    codes.push(Vec::new());
+                                } else {
+                                    codes.push(
+                                        l[..l.len() - ad].iter().map(|&b| encode_base(b)).collect(),
+                                    );
+                                }
+                            }
                         }
-                        buf.iter().map(|&b| encode_base(b)).collect()
-                    })
-                    .collect();
+                        codes
+                    }
+                };
                 if both_strands {
                     skipped *= 2;
                 }
@@ -1917,6 +2813,7 @@ mod gpu {
         _tx: SyncSender<Batch>,
         _both_strands: bool,
         _max_read_len: usize,
+        _pair: Option<PairCfg>,
     ) -> anyhow::Result<GpuStats> {
         match scorer {}
     }
@@ -1941,7 +2838,7 @@ mod tests {
             |len: usize| InRecord::Buf(fastx_to_record(b"r".to_vec(), vec![b'A'; len], None));
         let mut batch: Vec<InRecord> = (0..100).map(|_| read(100)).collect();
         batch.insert(10, read(300_000));
-        let sizes: Vec<usize> = cut_chunks(batch).iter().map(Vec::len).collect();
+        let sizes: Vec<usize> = cut_chunks(batch, false).iter().map(Vec::len).collect();
         // 10 short, the giant alone, then the other 90 in chunks of <= CHUNK.
         assert_eq!(sizes, vec![10, 1, CHUNK, 90 - CHUNK]);
     }
