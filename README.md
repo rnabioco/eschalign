@@ -60,9 +60,31 @@ the content). Common options:
 | `--read-ids <FILE>` | align only the named reads |
 | `-t, --threads <N>`, `--batch-size <N>` | parallelism and memory |
 | `--device <auto\|cpu\|gpu>` | where panel scoring runs (see below) |
+| `-1`, `-2`, `--interleaved` | paired-end input — see [Paired-end](#paired-end) |
 | `-v`, `-vv`, `-q` | log verbosity; `RUST_LOG` wins |
 
 Full reference, output semantics and examples: [docs/align.md](docs/align.md).
+
+## Paired-end
+
+Illumina read pairs are aligned **as pairs**: the reference that maximises the
+two mates' summed score wins, so a mate that is ambiguous alone (paralogs,
+isodecoders) is placed by its partner. Input is two FASTQs, an interleaved
+FASTQ, or an unaligned BAM with 0x1/0x40/0x80 flags:
+
+```bash
+eschalign -1 R1.fq.gz -2 R2.fq.gz -r panel.fa -o aligned.bam --min-score 40
+eschalign pairs.fq.gz --interleaved -r panel.fa -o aligned.bam --min-score 40
+eschalign pairs.ubam -r panel.fa -o aligned.bam --min-score 40
+```
+
+3' adapter read-through is detected first (TruSeq prefixes by default) and kept
+as soft clip with an `ad:i` tag; the rest of each mate is aligned end to end, so
+a mismatch at a read end stays an `MD`/`NM` mismatch (paired runs default to
+`--mode semiglobal`). Pairs over `--max-insert` (default 500) or facing the wrong
+way are written without 0x2, each mate at its own best reference. Paired runs
+need a `--min-score`. See [docs/align.md](docs/align.md#paired-end) for the
+rules, flags and every decision.
 
 ## GPU
 

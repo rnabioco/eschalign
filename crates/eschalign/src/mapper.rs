@@ -23,6 +23,9 @@ use crate::scalar::Alignment;
 use crate::scoring::{Mode, Scoring};
 use crate::simd::{self, Backend, Kernel, Profile};
 
+mod pair;
+pub use pair::{PairHit, PairMapping, PairOptions};
+
 /// Per-read policy. The default: minimum score 0, every tie traced, forward
 /// strand only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

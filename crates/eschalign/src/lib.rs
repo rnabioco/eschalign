@@ -30,6 +30,8 @@
 //!   i16 saturating), AVX2 and AVX-512BW, runtime-dispatched.
 //! * [`sam`] — CIGAR strings and the `MD`/`NM` pair, reproducing
 //!   `samtools calmd` including at reference ambiguity codes.
+//! * [`adapter`] — 3' adapter read-through detection, run before a read pair
+//!   is aligned.
 //! * [`Aligner`] — the panel plus the dispatch plus winner selection: what a
 //!   caller actually uses.
 //! * [`fasta`] — the one reference FASTA parser (rnabioco/escapepod-rs#410):
@@ -46,6 +48,7 @@
 //! gzipped) FASTA file before handing it to [`fasta::read_fasta`], is
 //! `eschalign-cli`'s job.
 
+pub mod adapter;
 pub mod alphabet;
 #[cfg(feature = "gpu")]
 pub mod cuda;
@@ -59,7 +62,9 @@ mod scoring;
 pub mod simd;
 
 pub use error::AlignError;
-pub use mapper::{Aligner, Hit, MapOptions, ReadMapping, ScoreMatrix};
+pub use mapper::{
+    Aligner, Hit, MapOptions, PairHit, PairMapping, PairOptions, ReadMapping, ScoreMatrix,
+};
 pub use panel::{Panel, Reference};
 pub use scalar::{Alignment, CigarOp};
 pub use scoring::{Mode, Scoring};

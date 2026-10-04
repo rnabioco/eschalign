@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Paired-end alignment** (#1). `-1 R1 -2 R2`, `--interleaved`, or a BAM of
+  0x1/0x40/0x80 mates align read pairs as pairs: the reference maximising the
+  two mates' summed score wins (both mates at or above `--min-score`), under an
+  orientation rule and `--max-insert` (default 500). A pair no reference
+  satisfies is written without 0x2, each mate at its own best reference on
+  either strand. Standard paired SAM: flags, `RNEXT`/`PNEXT`/`TLEN`, `MC`,
+  per-mate `NM`/`MD`/`AS`/`XS`/`XA`, MAPQ 60 only for a unique best reference,
+  mates adjacent in input order, `--sort coordinate` and `--secondary` supported.
+  See [docs/align.md](docs/align.md#paired-end).
+- 3' adapter read-through is detected before alignment (TruSeq Read 1/2
+  prefixes; `--adapter-r1`, `--adapter-r2`, `--min-adapter-overlap`,
+  `--no-adapter-trim`), the adapter is kept as soft clip with an `ad:i` tag, and
+  the rest of each mate is aligned end to end so terminal mismatches stay in
+  `MD`/`NM`. Paired runs therefore default to `--mode semiglobal` (an explicit
+  `--mode local` is honoured and warned about).
+- Library: `eschalign::adapter`, `Aligner::map_pairs`/`map_pairs_scored`,
+  `PairOptions`, `PairMapping`, `PairHit`.
+- Tests: `align_paired.rs` over a synthesized pair fixture in
+  `tests/fixtures/pairs/`; `align_unpaired.rs` pins the unpaired output to a
+  golden record-stream digest.
+
+### Changed
+
+- A BAM whose first record is flagged paired (0x1 with 0x40/0x80) is now a
+  paired run; it used to be read as unpaired reads with the flags discarded.
+  Every other input, and every existing flag, behaves as before (output
+  byte-identical, `unpaired_output_unchanged`).
+
 ## 0.1.0
 
 First release of eschalign as a standalone tool.

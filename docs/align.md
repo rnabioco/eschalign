@@ -29,7 +29,7 @@ eschalign [OPTIONS] -r <FASTA> -o <BAM> <READS>
 
 | Argument | Description |
 |----------|-------------|
-| `<READS>` | Reads: an unaligned BAM (dorado's uBAM), or FASTA/FASTQ, plain or gzip. The format is sniffed from the content, not the extension |
+| `<READS>` | Reads: an unaligned BAM (dorado's uBAM), or FASTA/FASTQ, plain or gzip. The format is sniffed from the content, not the extension. Omitted with `-1`/`-2` |
 
 A BAM whose records are already aligned is accepted too, as long as they are on
 the forward strand (the read as sequenced): the alignment fields and any
@@ -46,7 +46,7 @@ reverse-strand record is refused.
 | `--sort <unsorted\|coordinate>` | Record order (default `unsorted`) — see [Sorted output](#sorted-output) |
 | `--sort-memory <SIZE>` | With `--sort coordinate`, records held in memory before spilling to a temporary file (default `4G`; `K`/`M`/`G`/`T`, binary) |
 | `--tmp-dir <DIR>` | With `--sort coordinate`, where the spill file goes (default: the output's directory; `$TMPDIR` for `-o -`) |
-| `--mode <MODE>` | `local` (default) or `semiglobal` — see [Modes](#modes) |
+| `--mode <MODE>` | `local` (default; `semiglobal` for paired input) or `semiglobal` — see [Modes](#modes) |
 | `--scoring <M,X,O,E>` | Match, mismatch, gap open, gap extend (default `2,-1,-10,-1`) — see [Scoring](#scoring) |
 | `--min-score <N>` | A read whose best score is below this is written unmapped (default `0`) |
 | `--max-read-len <N>` | A read longer than this (nt) is not aligned at all and is written unmapped (default `1000`; `0` = no limit) — see [Long reads](#long-reads) |
@@ -56,6 +56,12 @@ reverse-strand record is refused.
 | `--read-ids <FILE>` | Align only the reads named in FILE, one per line (like `samtools view -N`); the rest are not written |
 | `--batch-size <N>` | Reads per batch (default `50000`); memory is proportional to it |
 | `-t, --threads <N>` | Threads for parallel processing |
+| `-1, --r1 <FASTQ>`, `-2, --r2 <FASTQ>` | Paired input: mate 1 and mate 2 files (plain or gzip). Mates are matched by name, `/1` and `/2` stripped — see [Paired-end](#paired-end) |
+| `--interleaved` | `READS` is an interleaved FASTQ/FASTA (mate 1, mate 2, …). A BAM's pairing comes from its flags and needs no option |
+| `--max-insert <N>` | Paired only: longest insert a proper pair may have (default `500`) |
+| `--adapter-r1 <SEQ>`, `--adapter-r2 <SEQ>` | Paired only: 3' adapter of each mate (default TruSeq Read 1 / Read 2) |
+| `--min-adapter-overlap <N>` | Paired only: shortest 3' match counted as adapter (default `5`) |
+| `--no-adapter-trim` | Paired only: no adapter detection, no `ad` tag |
 | `--device <auto\|cpu\|gpu>` | Where panel scoring runs (a `gpu` build only; tracebacks and output are always on the CPU, and the output is identical either way). `auto` (default) scores on a visible CUDA GPU, else on the CPU; `cpu` forces the CPU; `gpu` requires the GPU and fails rather than falling back. See [GPU scoring](#gpu-scoring) |
 
 ## Scoring
@@ -179,6 +185,175 @@ So a read that matches its reference everywhere except across the reference's
 one `N` has `NM:i:1` and an `MD` with that `N` in it, and `AS` counts the `N`
 as a match. A pipeline stage that used `samtools calmd` after bwa sees the same
 `MD`/`NM` for the same CIGAR.
+
+## Paired-end
+
+`-1 R1 -2 R2`, `--interleaved`, or a BAM whose first record carries 0x1 with
+0x40 or 0x80 switches on paired-end alignment (rnabioco/eschalign#1). The three
+input forms give identical output for the same pairs, and the unpaired path —
+every run without paired input — is unchanged, byte for byte.
+
+```bash
+eschalign -1 R1.fq.gz -2 R2.fq.gz -r panel.fa -o aligned.bam --min-score 40
+eschalign pairs.fq.gz --interleaved -r panel.fa -o aligned.bam --min-score 40
+eschalign pairs.ubam -r panel.fa -o aligned.bam --min-score 40
+```
+
+Built for snRNAs up to ~250 nt captured by two overlapping mates, and for any
+panel with paralogs: the partner mate resolves a mate that is ambiguous alone,
+and the signal at the read ends — RT stops, misincorporation — is kept. Better
+handling comes first; there is no speed work in it (a paired run scores every
+mate once, and traces a tier of candidates at a time).
+
+**Use `--min-score`.** Semi-global scoring (the paired default) gives every read
+*some* positive score somewhere, so without a floor a mate that matches nothing
+is still "aligned" and a wrong-way pair can find a junk partner. The floor
+applies to each mate (below).
+
+### Input
+
+* **Two files**: `-1 R1.fq -2 R2.fq` (FASTQ or FASTA, plain or gzip); record *k*
+  of one is the mate of record *k* of the other.
+* **Interleaved**: `READS --interleaved`, mate 1 then mate 2.
+* **BAM**: an unaligned BAM with 0x1 and 0x40/0x80, mates adjacent. Pairing is
+  taken from the first primary record, so no option is needed. (A BAM with those
+  flags used to run as unpaired reads, the flags discarded; it is now a paired
+  run. A forward-strand aligned BAM is still accepted, as it is for single
+  reads; its alignment is discarded.)
+
+Mates are matched on name with a trailing `/1` or `/2` stripped. **An orphan
+mate or a name mismatch is a hard error naming the read** — a mate file that is
+a record short, an interleaved file with a trailing record, mates that are not
+adjacent in a BAM, a paired-flagged record in an otherwise unpaired BAM. Both
+mates are written under the stripped name. `--read-ids` selects pairs by that
+name. Secondary and supplementary records are skipped as for single reads.
+
+### Adapters: detected first, bases kept
+
+`local` mode soft-clips mismatches near a read end, which would erase the
+misincorporation and RT-stop signal at the 3' end that this mode is for. So the
+adapter is found *before* alignment, on each mate's 3' end:
+
+1. The adapter's prefix (`--adapter-r1`/`--adapter-r2`; TruSeq Read 1
+   `AGATCGGAAGAGCACACGTCTGAACTCCAGTCA` and Read 2
+   `AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT`) is searched at every position of the
+   read, leftmost first. `read[p..]` is compared with the adapter's first
+   `min(adapter length, bases left)` bases, so a read that ends inside the
+   adapter still matches. A stretch counts when it is at least
+   `--min-adapter-overlap` long (default 5) and has at most one mismatch per ten
+   bases of overlap (`overlap / 10`, rounded down: none below ten bases); `N` and
+   other non-ACGT letters match anything.
+2. The mates must agree where the insert ends. Both reading through means
+   `len1 − ad1 = len2 − ad2`; where they disagree one detection is chance, so
+   the one with the shorter adapter overlap is dropped (both, on a tie). The
+   check is made on the read less its adapter rather than after alignment — a
+   trimmed mate's 3' end *is* the insert end, so it is the same quantity — which
+   keeps the alignment's input fixed.
+3. Only the bases before the adapter are aligned. The adapter bases are written
+   as a soft clip (at the end of `SEQ` for a forward mate, the start for a
+   reverse one), and `ad:i` says how many there were. **Nothing is discarded**:
+   `SEQ` and `QUAL` are the whole read.
+
+`ad:i` is each mate's *own* adapter length, and is present (0 when none) on every
+primary record of a paired run that searched; with `--no-adapter-trim` it is
+absent. When only one mate reads through — a shorter or trimmed partner — that
+mate carries the count and the other carries `ad:i:0`.
+
+### Aligning end to end
+
+The remainder of each mate is aligned so that a terminal mismatch stays a
+mismatch: paired input defaults to `--mode semiglobal`, in which a mate's ends
+are kept unless the alignment reaches the end of the reference (where the
+overhang is free). A terminal mismatch is then in `MD`/`NM`, not clipped:
+
+```
+mate 1, last base a mismatch:   CIGAR 60M   MD:Z:59G0   NM:i:1   (not 59M1S)
+```
+
+An explicit `--mode local` is honoured — and clips again; a warning says so.
+
+### Choosing the reference
+
+A *candidate* is a reference and a template strand. On the forward template
+strand mate 1 is read as sequenced and mate 2 is reverse-complemented (an `FR`
+pair, mate 1 upstream — the layout of a stranded sense library); `--strand
+both` adds the reverse template strand (mate 1 reverse-complemented, mate 2 as
+sequenced). Candidate score = `score(mate 1) + score(mate 2)` against the
+reference.
+
+1. A candidate is eligible only if **both** mates are at or above `--min-score`.
+   (The spec's open question: both, not just the sum — one good mate must not
+   carry a bad one.)
+2. Eligible candidates are taken in descending score, and the first score at
+   which some candidate also satisfies the constraints wins; **every** candidate
+   at that score that satisfies them is the tie set (reference order, forward
+   strand first), its first member the primary. A better-scoring candidate that
+   violates a constraint falls through to the next score rather than winning.
+3. The constraints, on the traced alignments:
+   * both mates align at least one base;
+   * orientation: the mate on the template's forward strand starts before the
+     other mate ends (no "outie"); two mates on the same strand (`FF`/`RR`) are
+     not a candidate at all;
+   * insert ≤ `--max-insert` (default 500), the insert being the span from the
+     leftmost aligned reference base of either mate to the rightmost. An insert
+     shorter than the read length — full overlap and read-through — is valid.
+4. If no candidate qualifies the pair is written **without 0x2**, and each mate
+   is mapped as an unpaired read would be, on **both** strands — a mate that is
+   the wrong way round is reported where it is, not forced onto the strand the
+   pair rule wanted — with its own tie set, MAPQ, `XA` and `XS`.
+
+### Paired output
+
+Records are in input order with the two mates adjacent, mate 1 then mate 2;
+`--secondary` records follow the pair. With `--sort coordinate` the order is
+`samtools sort`'s, so mates are placed by their own coordinates and each record's
+`RNEXT`/`PNEXT` still name its partner's place.
+
+| Field | Paired value |
+|-------|--------------|
+| `FLAG` | 0x1; 0x2 only for a proper pair; 0x10 / 0x20 for each mate's / its partner's strand; 0x40 / 0x80; 0x4 / 0x8 for an unmapped mate / partner; QC-fail and duplicate (0x200, 0x400) from the input |
+| `RNEXT` / `PNEXT` | the partner's reference and position (`=` is the same reference); for an unmapped partner, the mate's own |
+| `TLEN` | the true insert — leftmost aligned base to rightmost, over both mates — positive on the leftmost mate (mate 1 if they start together), negative on the other. Set for any pair with both mates on one reference, proper or not |
+| `MC:Z` | the partner's CIGAR (absent when the partner is unmapped) |
+| `AS:i` | that mate's own score (the pair score is the two summed) |
+| `XS:i` | that mate's best score over the candidates outside the pair's tie set |
+| `XA:Z` | `ref,±pos,CIGAR,NM;` — see below |
+| `NM:i`, `MD:Z` | per mate, as `samtools calmd` |
+| `ad:i` | adapter bases at the 3' end — see above |
+| MAPQ | **60** for a unique best reference, 0 for a tie — for both mates of a pair, nothing in between |
+
+An unmapped mate (it matched nothing at `--min-score`) is written the way
+`samtools` does: flag 0x4, placed at its mapped partner's reference and
+position, and the partner carries 0x8. The paired-run summary reports pairs and
+how many were proper.
+
+**`XA` in a pair.** The open question was whether pair-level `XA` encodes both
+mates' positions. It does not: each mate's `XA` lists *that mate's* alignment in
+every other tied pair, in bwa's `ref,±pos,CIGAR,NM;` format, and the entries run
+in the same order on both mates — entry *k* of mate 1 and entry *k* of mate 2
+are the two halves of tied pair *k*. That keeps `XA` the grammar every parser
+already reads, and the partner position of an entry is in the same position of
+the other mate's tag. `--secondary` writes the same ties as 0x100 records, mate 1
+then mate 2 for each further pair, whose mate fields point at the partner of
+that same pair; no `SEQ`/`QUAL`, tags `NM`, `MD`, `AS`, `RG` only.
+
+Every input tag is copied byte for byte, as for single reads, on both mates;
+`NM`/`MD`/`AS`/`XS`/`XA`/`MC`/`ad` are the aligner's. Mates over `--max-read-len`
+follow the existing rule: that mate is written unmapped, and its partner is
+aligned alone.
+
+### GPU
+
+`--device gpu` scores each mate (as sequenced and reverse-complemented, after
+adapter trimming) on the device; pair resolution, tracebacks and records are the
+CPU path's own code, so paired output is byte-identical either way.
+
+### Not in this mode
+
+Overlap merging into a consensus read, joint paired DP, estimating the insert
+distribution from the data, and orphan/single-end handling inside a paired run
+(an orphan is an error). The long-read path of `--max-read-len 0` is not used for
+mates.
 
 ## Kernels
 
@@ -308,6 +483,9 @@ eschalign calls.ubam -r trna.fa -o aligned.bam --sort coordinate
 
 # Ties as secondary records, at most 5 per read
 eschalign calls.ubam -r trna.fa -o aligned.bam --secondary --max-ties 5
+
+# Illumina read pairs, adapter read-through kept as soft clip (ad:i)
+eschalign -1 R1.fq.gz -2 R2.fq.gz -r snrna.fa -o aligned.bam --min-score 40 --max-insert 300
 ```
 
 ## Environment variables
