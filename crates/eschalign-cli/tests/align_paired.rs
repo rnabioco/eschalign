@@ -740,3 +740,66 @@ fn pair_gpu_matches_cpu() {
         assert_eq!(cpu, gpu, "flags {extra:?}");
     }
 }
+
+/// Chunks and batches are cut between pairs, never inside one: a few hundred
+/// pairs through tiny batches on several threads come out in input order, mates
+/// adjacent, record for record what one big batch gives.
+#[test]
+fn pair_chunking_keeps_mates_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let refs: Vec<String> = ["P1", "P2", "U1", "U2"].map(fasta_seq).to_vec();
+    let rc = |s: &str| -> String {
+        s.bytes()
+            .rev()
+            .map(|b| match b {
+                b'A' => 'T',
+                b'C' => 'G',
+                b'G' => 'C',
+                _ => 'A',
+            })
+            .collect()
+    };
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |n: usize| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x % n as u64) as usize
+    };
+    let (mut t1, mut t2) = (String::new(), String::new());
+    for k in 0..300 {
+        let r = &refs[next(refs.len())];
+        let start = next(40);
+        let len = 30 + next(40);
+        let insert = &r[start..start + len + next(30)];
+        let q = "I".repeat(len);
+        t1.push_str(&format!("@p{k}\n{}\n+\n{q}\n", &insert[..len]));
+        t2.push_str(&format!(
+            "@p{k}\n{}\n+\n{q}\n",
+            rc(&insert[insert.len() - len..])
+        ));
+    }
+    let (f1, f2) = (dir.path().join("r1.fq"), dir.path().join("r2.fq"));
+    std::fs::write(&f1, t1).unwrap();
+    std::fs::write(&f2, t2).unwrap();
+    let (_, big) = align_files(dir.path(), "big", &f1, &f2, STD);
+    let (_, small) = align_files(
+        dir.path(),
+        "small",
+        &f1,
+        &f2,
+        &[STD, &["--batch-size", "7", "-t", "4", "--secondary"]].concat(),
+    );
+    assert_eq!(big.len(), 600);
+    let primary: Vec<RecordBuf> = small
+        .iter()
+        .filter(|r| !r.flags().is_secondary())
+        .cloned()
+        .collect();
+    assert_eq!(lines(&big), lines(&primary));
+    for (k, pair) in big.chunks(2).enumerate() {
+        assert_eq!(name(&pair[0]), format!("p{k}"));
+        assert_eq!(name(&pair[1]), format!("p{k}"));
+        assert!(pair[0].flags().is_first_segment() && pair[1].flags().is_last_segment());
+    }
+}
