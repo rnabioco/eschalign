@@ -1,8 +1,8 @@
-//! `escpod align` — all-vs-all alignment of reads to a small reference panel
+//! `eschalign` — all-vs-all alignment of reads to a small reference panel
 //! (tRNA), writing an input-ordered (or, with `--sort coordinate`,
 //! coordinate-sorted) BAM with every input tag carried through.
 //!
-//! The DP, the kernels and the winner/tie rules live in `escapepod_align`;
+//! The DP, the kernels and the winner/tie rules live in the `eschalign` library crate;
 //! this command is I/O and orchestration:
 //!
 //! ```text
@@ -20,7 +20,7 @@
 //!
 //! # With the scoring on a GPU
 //!
-//! When `--device` places [`Stage::Align`](crate::device::Stage::Align) on the
+//! When `--device` places the scoring stage on the
 //! GPU, one more thread sits between the reader and the dispatcher:
 //!
 //! ```text
@@ -37,7 +37,7 @@
 //! `Aligner::map_reads_scored` instead of scoring — everything after the
 //! scores (the tie set, the pairs-kernel tracebacks, `MD`/`NM`, the records)
 //! is the CPU path's own code, so the output is byte-identical. A read the
-//! kernel does not take (over `escapepod_align::cuda::MAX_READ_LEN`, or
+//! kernel does not take (over `eschalign::cuda::MAX_READ_LEN`, or
 //! outside the `i16` bound) comes back unscored, and its worker scores it on
 //! the CPU. The GPU thread works on batch *k + 1* while the pool finishes
 //! batch *k*; the channel after it holds two, so memory stays O(`--batch-size`).
@@ -89,9 +89,9 @@
 //!   never dropped. Of the input flags only QC-fail (0x200) and duplicate
 //!   (0x400) survive; everything else is the aligner's to set.
 
+use crate::uuid_util::parse_uuid_flexible;
 use anyhow::{Context, bail};
 use clap::Args;
-use escapepod_signal::parse_uuid_flexible;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::File;
@@ -119,7 +119,7 @@ use sam::header::record::value::map::{self, Program, ReferenceSequence, program:
 
 use std::sync::Arc;
 
-use escapepod_align::{
+use eschalign::{
     Aligner, Backend, CigarOp, Hit, MapOptions, Mode, Panel, ReadMapping, ScoreMatrix, Scoring,
     sam as align_sam,
 };
@@ -279,8 +279,7 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
 }
 
 fn parse_scoring(s: &str) -> Result<Scoring, String> {
-    s.parse()
-        .map_err(|e: escapepod_align::AlignError| e.to_string())
+    s.parse().map_err(|e: eschalign::AlignError| e.to_string())
 }
 
 /// Tags this command owns: any the input carried are replaced (or, on an
@@ -501,12 +500,12 @@ fn fastx_to_record(name: Vec<u8>, seq: Vec<u8>, qual: Option<Vec<u8>>) -> Record
 
 /// Load the reference panel (FASTA, plain or gzip), in file order.
 fn load_reference(path: &Path) -> anyhow::Result<Panel> {
-    let refs = escapepod_align::fasta::read_fasta(open_text(path)?)
+    let refs = eschalign::fasta::read_fasta(open_text(path)?)
         .with_context(|| format!("reading reference {}", path.display()))?;
     Panel::new(refs).with_context(|| format!("reading reference {}", path.display()))
 }
 
-/// Canonicalise a read name for `--read-ids` matching, the way `escpod
+/// Canonicalise a read name for `--read-ids` matching, the way `eschalign
 /// filter`'s ID list does: a name that parses as a UUID — dashed or the
 /// dashless 32-hex-char form `parse_uuid_flexible` also accepts — compares by
 /// its canonical dashed lowercase string, so either spelling names the same
@@ -570,7 +569,7 @@ fn read_batches(
                 }
                 if !flags.is_unmapped() && flags.is_reverse_complemented() {
                     bail!(
-                        "input record {} is aligned to the reverse strand; `escpod align` \
+                        "input record {} is aligned to the reverse strand; `eschalign` \
                          takes unaligned reads (or forward-strand alignments, whose SEQ is \
                          the read as sequenced)",
                         rec.name()
@@ -709,7 +708,7 @@ fn build_records(
     let mut flags = kept_flags;
     if primary.reverse {
         flags |= Flags::REVERSE_COMPLEMENTED;
-        let rc = escapepod_align::alphabet::reverse_complement(rec.sequence().as_ref());
+        let rc = eschalign::alphabet::reverse_complement(rec.sequence().as_ref());
         *rec.sequence_mut() = rc.into();
         let mut q: Vec<u8> = rec.quality_scores().as_ref().to_vec();
         q.reverse();
@@ -806,9 +805,13 @@ fn over_limit(max_read_len: usize, len: usize) -> bool {
 }
 
 /// `=1` puts every read back on the row-major score kernel and on one
-/// thread per chunk — `escpod align` as it was before the long-read path
+/// thread per chunk — `eschalign` as it was before the long-read path
 /// (#415). An A/B lever: the output is the same either way.
-const ROW_MAJOR_ONLY_ENV: &str = "ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY";
+const ROW_MAJOR_ONLY_ENV: &str = "ESCHALIGN_ROW_MAJOR_ONLY";
+
+/// The name this switch had inside escapepod-rs (`escpod align`); still
+/// honoured, but [`ROW_MAJOR_ONLY_ENV`] wins whenever it is set.
+const ROW_MAJOR_ONLY_ENV_DEPRECATED: &str = "ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY";
 
 /// Reads per unit of rayon work. The winners of a chunk's reads are traced
 /// together, so this is also how full the traceback kernels' lanes get.
@@ -886,13 +889,13 @@ fn process_chunk(
             if !ctx.split_long || seq.len() < SPLIT_MIN_BASES {
                 return [None, None];
             }
-            let fwd = escapepod_align::alphabet::encode(seq);
+            let fwd = eschalign::alphabet::encode(seq);
             let mut out = [None, None];
             if gpu_row(k, false).is_none() {
                 out[0] = score_across_pool(ctx.aligner, &fwd);
             }
             if ctx.opts.both_strands && gpu_row(k, true).is_none() {
-                let rev = escapepod_align::alphabet::reverse_complement_codes(&fwd);
+                let rev = eschalign::alphabet::reverse_complement_codes(&fwd);
                 out[1] = score_across_pool(ctx.aligner, &rev);
             }
             let n = out.iter().filter(|r| r.is_some()).count() as u64;
@@ -940,7 +943,7 @@ fn process_chunk(
 /// own scalar fallback must score it.
 fn score_across_pool(aligner: &Aligner, codes: &[u8]) -> Option<Vec<i16>> {
     let panel = aligner.panel();
-    if !escapepod_align::simd::fits_i16(codes.len(), panel.max_len(), aligner.scoring()) {
+    if !eschalign::simd::fits_i16(codes.len(), panel.max_len(), aligner.scoring()) {
         return None;
     }
     // Known hazard, left as is: while this chunk's task waits here for its
@@ -989,11 +992,11 @@ fn build_header(
     *header.comments_mut() = input.comments().to_vec();
     let cl: Vec<String> = std::env::args().collect();
     let pg = Map::<Program>::builder()
-        .insert(pg_tag::NAME, "escpod")
+        .insert(pg_tag::NAME, "eschalign")
         .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
         .insert(pg_tag::COMMAND_LINE, cl.join(" "))
         .build()?;
-    header.programs_mut().add("escpod-align", pg)?;
+    header.programs_mut().add("eschalign", pg)?;
     Ok(header)
 }
 
@@ -1014,7 +1017,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     let device = args.device.resolve();
     // Decided and reported before anything is read, so a missing feature or
     // device is the first line of the run, not a surprise at the end of it.
-    let placement = crate::device::place_and_report(device, crate::device::Stage::Align)?;
+    let placement = crate::device::place_and_report(device)?;
     if args.batch_size == 0 {
         bail!("--batch-size must be at least 1");
     }
@@ -1030,7 +1033,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     );
     if panel.len() > 10_000 || panel.max_len() > 1_000 {
         warn!(
-            "`escpod align` scores every read against every reference with no seeding; \
+            "`eschalign` scores every read against every reference with no seeding; \
              it is built for small panels (<= ~10k references of <= ~1 kb) and runs \
              proportionally slower beyond that"
         );
@@ -1038,10 +1041,11 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     if let Err(v) = Backend::cap_from_env() {
         warn!(
             "{}={v}: not a kernel name (scalar|avx2|avx512), ignored",
-            escapepod_align::simd::BACKEND_ENV
+            eschalign::simd::BACKEND_ENV
         );
     }
-    let row_major_only = escapepod_signal::pod5::env::flag(ROW_MAJOR_ONLY_ENV);
+    let row_major_only =
+        crate::env::flag_with_alias(ROW_MAJOR_ONLY_ENV, ROW_MAJOR_ONLY_ENV_DEPRECATED);
     let mut aligner = Aligner::new(panel, args.scoring, args.mode)?;
     if row_major_only {
         aligner = aligner.with_transposed_min_len(None);
@@ -1165,7 +1169,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     }
     let batch_size = args.batch_size;
     let reader = std::thread::Builder::new()
-        .name("escpod-align-reader".into())
+        .name("eschalign-reader".into())
         .spawn(move || read_batches(source, wanted, batch_size, in_tx))?;
     // With a GPU, its thread sits between the reader and the dispatcher; the
     // channel after it is as shallow as the one before, for the same memory
@@ -1176,7 +1180,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
             let both = opts.both_strands;
             let max_read_len = args.max_read_len;
             let t = std::thread::Builder::new()
-                .name("escpod-align-gpu".into())
+                .name("eschalign-gpu".into())
                 .spawn(move || gpu::score_batches(scorer, in_rx, tx, both, max_read_len))?;
             (Box::new(rx.into_iter()), Some(t))
         }
@@ -1185,7 +1189,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     let spinner = create_spinner("aligning")?;
     let writer_spinner = spinner.clone();
     let writer_thread = std::thread::Builder::new()
-        .name("escpod-align-writer".into())
+        .name("eschalign-writer".into())
         .spawn(move || {
             write_in_order(writer, sorter, res_rx, permit_tx, &writer_spinner, started)
         })?;
@@ -1735,7 +1739,7 @@ mod gpu {
     use super::*;
 
     #[cfg(feature = "gpu")]
-    pub(super) use escapepod_align::cuda::{GpuScorer, MAX_READ_LEN};
+    pub(super) use eschalign::cuda::{GpuScorer, MAX_READ_LEN};
 
     /// Stand-in so the pipeline compiles identically without the feature;
     /// uninhabited, so nothing can construct one.
@@ -1820,7 +1824,7 @@ mod gpu {
         both_strands: bool,
         max_read_len: usize,
     ) -> anyhow::Result<GpuStats> {
-        use escapepod_align::alphabet::{encode_base, reverse_complement_codes};
+        use eschalign::alphabet::{encode_base, reverse_complement_codes};
         let mut stats = GpuStats {
             queries: 0,
             scored: 0,
@@ -1830,7 +1834,7 @@ mod gpu {
         let (mut wait_in, mut prep, mut wait_gpu, mut wait_out) = (0.0, 0.0, 0.0, 0.0);
         // One batch in flight on the device while the next is encoded and
         // packed here, so the kernel is not idle between batches.
-        let mut in_flight: Option<(Vec<InRecord>, escapepod_align::cuda::PendingBatch)> = None;
+        let mut in_flight: Option<(Vec<InRecord>, eschalign::cuda::PendingBatch)> = None;
         let mut t = Instant::now();
         let mut rx = rx.into_iter();
         loop {

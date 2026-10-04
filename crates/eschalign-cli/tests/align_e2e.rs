@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! End-to-end `escpod align` over escapepod-classify's fixtures: 60 reads
+//! End-to-end `eschalign` over the tRNA fixtures in `fixtures/`: 60 reads
 //! (bwa-aligned, tags carried through — treated here as input, the way a
 //! uBAM would be) against the 47-reference tRNA panel they were aligned to.
 
@@ -9,27 +9,22 @@ use noodles_sam as sam;
 use sam::alignment::RecordBuf;
 use sam::alignment::record::data::field::Tag;
 use sam::alignment::record_buf::data::field::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const OWNED: [[u8; 2]; 5] = [*b"NM", *b"MD", *b"AS", *b"XS", *b"XA"];
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("escapepod-classify/tests/fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 fn input_bam() -> PathBuf {
     fixtures().join("trna_mappings_padded.bam")
 }
 
-/// Run `escpod align <reads> -r <reference> -o <out> <extra…>`, returning stderr.
+/// Run `eschalign <reads> -r <reference> -o <out> <extra…>`, returning stderr.
 fn align(reads: &Path, reference: &Path, out: &Path, extra: &[&str]) -> String {
-    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("align")
+    let o = Command::new(env!("CARGO_BIN_EXE_eschalign"))
         .arg(reads)
         .arg("--reference")
         .arg(reference)
@@ -37,9 +32,9 @@ fn align(reads: &Path, reference: &Path, out: &Path, extra: &[&str]) -> String {
         .arg(out)
         .args(extra)
         .output()
-        .expect("escpod align should launch");
+        .expect("eschalign should launch");
     let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-    assert!(o.status.success(), "escpod align failed:\n{stderr}");
+    assert!(o.status.success(), "eschalign failed:\n{stderr}");
     stderr
 }
 
@@ -124,7 +119,7 @@ fn align_fixture_reproduces_reference_assignment() {
             .to_string(),
         "tRNA-Ala-GGC-1-1"
     );
-    assert!(out_h.programs().as_ref().contains_key(&b"escpod-align"[..]));
+    assert!(out_h.programs().as_ref().contains_key(&b"eschalign"[..]));
     for (i, o) in input.iter().zip(&output) {
         // Input order is preserved record for record.
         assert_eq!(name(i), name(o));
@@ -354,124 +349,6 @@ fn fastq_input_matches_ubam_input() {
     }
 }
 
-/// `escpod classify` over the aligner's output must reproduce the charging
-/// golden for every read whose alignment is the fixture's own. Scored with
-/// bwa `-x ont2d`'s penalties in this convention (the fixture BAM's @PG), so
-/// the CIGARs are comparable; the reads whose CIGAR differs are counted and
-/// printed rather than asserted on — a different optimal path is a different
-/// feature window, not an aligner error.
-#[cfg(feature = "classify")]
-#[test]
-fn align_then_classify_reproduces_golden_calls() {
-    let dir = tempfile::tempdir().unwrap();
-    let aligned = dir.path().join("aligned.bam");
-    let reference = fixtures().join("trna_reference.fa");
-    align(
-        &input_bam(),
-        &reference,
-        &aligned,
-        &["--scoring", "1,-1,-2,-1"],
-    );
-
-    let (in_h, input) = read_bam(&input_bam());
-    let (out_h, output) = read_bam(&aligned);
-    let fixture_aln: HashMap<String, (Option<String>, usize, String)> = input
-        .iter()
-        .map(|r| {
-            (
-                name(r),
-                (
-                    ref_name(&in_h, r),
-                    r.alignment_start().unwrap().get(),
-                    cigar_string(r),
-                ),
-            )
-        })
-        .collect();
-    let mut differing = Vec::new();
-    for r in &output {
-        let ours = (
-            ref_name(&out_h, r),
-            r.alignment_start().map_or(0, |p| p.get()),
-            cigar_string(r),
-        );
-        if fixture_aln[&name(r)] != ours {
-            differing.push(name(r));
-        }
-    }
-    println!(
-        "align_then_classify: {} of {} reads have a CIGAR (or position) different from the \
-         fixture BAM's bwa alignment",
-        differing.len(),
-        output.len()
-    );
-
-    let calls_tsv = dir.path().join("calls.tsv");
-    let classified = dir.path().join("classified.bam");
-    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("classify")
-        .arg(fixtures().join("trna_reads.pod5"))
-        .arg("--bam")
-        .arg(&aligned)
-        .arg("--reference")
-        .arg(&reference)
-        .arg("--model")
-        .arg(fixtures().join("bundle"))
-        .arg("--output")
-        .arg(&classified)
-        .arg("--tsv")
-        .arg(&calls_tsv)
-        .output()
-        .unwrap();
-    assert!(
-        o.status.success(),
-        "classify failed:\n{}",
-        String::from_utf8_lossy(&o.stderr)
-    );
-
-    let golden: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(fixtures().join("charging_golden.json")).unwrap(),
-    )
-    .unwrap();
-    let calls: HashMap<String, (f64, u8)> = std::fs::read_to_string(&calls_tsv)
-        .unwrap()
-        .lines()
-        .skip(1)
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
-            (f[4].is_empty()).then(|| {
-                (
-                    f[0].to_string(),
-                    (f[2].parse().unwrap(), f[3].parse().unwrap()),
-                )
-            })
-        })
-        .collect();
-    let mut compared = 0;
-    for g in golden["reads"].as_array().unwrap() {
-        let id = g["read_id"].as_str().unwrap();
-        if differing.iter().any(|d| d == id) {
-            continue;
-        }
-        let p_ref = f64::from_bits(g["p_bits"].as_u64().unwrap());
-        let (p, cl) = calls
-            .get(id)
-            .unwrap_or_else(|| panic!("read {id}: identical CIGAR but no call"));
-        assert!(
-            (p - p_ref).abs() <= 1e-6,
-            "read {id}: P {p} vs golden {p_ref}"
-        );
-        assert_eq!(*cl as u64, g["cl"].as_u64().unwrap(), "read {id}: cl");
-        compared += 1;
-    }
-    println!(
-        "align_then_classify: {compared} of {} golden calls compared (the rest are reads whose \
-         alignment differs), all reproduced exactly",
-        golden["reads"].as_array().unwrap().len()
-    );
-    assert!(compared > 0, "no read kept the fixture's alignment");
-}
-
 fn revcomp(s: &[u8]) -> Vec<u8> {
     s.iter()
         .rev()
@@ -532,9 +409,9 @@ fn read_ids_select_reads() {
     assert_eq!(got, wanted);
 }
 
-/// A dashless ID list — the compact 32-hex-char form `escpod filter` also
+/// A dashless ID list — the compact 32-hex-char form pod5 tooling also
 /// accepts via `parse_uuid_flexible` — selects the same reads as the dashed
-/// one (rnabioco/escapepod-rs#409: `align.rs` used to match raw bytes, so a
+/// one (escapepod-rs#409, before this was carved out: `align.rs` used to match raw bytes, so a
 /// dashless list silently selected nothing).
 #[test]
 fn read_ids_dashless_selects_same_reads_as_dashed() {
@@ -566,8 +443,7 @@ fn read_ids_dashless_selects_same_reads_as_dashed() {
 #[test]
 fn device_gpu_is_refused_not_ignored() {
     let dir = tempfile::tempdir().unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("align")
+    let o = Command::new(env!("CARGO_BIN_EXE_eschalign"))
         .arg(input_bam())
         .arg("-r")
         .arg(fixtures().join("trna_reference.fa"))
@@ -598,8 +474,7 @@ fn device_gpu_is_refused_not_ignored() {
 fn device_gpu_output_is_byte_identical() {
     let dir = tempfile::tempdir().unwrap();
     let run = |device: &str, out: &Path, extra: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_escpod"))
-            .arg("align")
+        Command::new(env!("CARGO_BIN_EXE_eschalign"))
             .arg(input_bam())
             .arg("-r")
             .arg(fixtures().join("trna_reference.fa"))
@@ -653,8 +528,7 @@ fn device_gpu_output_is_byte_identical() {
 
 #[test]
 fn output_to_stdout() {
-    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("align")
+    let o = Command::new(env!("CARGO_BIN_EXE_eschalign"))
         .arg(input_bam())
         .arg("-r")
         .arg(fixtures().join("trna_reference.fa"))
@@ -702,8 +576,8 @@ fn long_read_alignment_matches_scalar_backend() {
     std::fs::write(&fa, &text).unwrap();
     let reference = fixtures().join("trna_reference.fa");
     let run = |backend: Option<&str>, out: &Path, extra: &[&str]| {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_escpod"));
-        c.args(["-v", "align"])
+        let mut c = Command::new(env!("CARGO_BIN_EXE_eschalign"));
+        c.arg("-v")
             .arg(&fa)
             .arg("-r")
             .arg(&reference)
@@ -711,10 +585,12 @@ fn long_read_alignment_matches_scalar_backend() {
             .arg(out)
             .args(["-t", "4", "--max-read-len", "0"])
             .args(extra)
-            .env_remove("ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY");
+            .env_remove("ESCHALIGN_ROW_MAJOR_ONLY")
+            .env_remove("ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY")
+            .env_remove("ESCAPEPOD_ALIGN_BACKEND");
         match backend {
-            Some(b) => c.env("ESCAPEPOD_ALIGN_BACKEND", b),
-            None => c.env_remove("ESCAPEPOD_ALIGN_BACKEND"),
+            Some(b) => c.env("ESCHALIGN_BACKEND", b),
+            None => c.env_remove("ESCHALIGN_BACKEND"),
         };
         let o = c.output().unwrap();
         let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
@@ -881,8 +757,7 @@ fn device_gpu_honours_max_read_len() {
     let (reads, input) = bam_with_long_reads(dir.path());
     let short = input.iter().filter(|r| r.sequence().len() <= 1000).count();
     let run = |device: &str, out: &Path, extra: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_escpod"))
-            .arg("align")
+        Command::new(env!("CARGO_BIN_EXE_eschalign"))
             .arg(&reads)
             .arg("-r")
             .arg(fixtures().join("trna_reference.fa"))
@@ -926,4 +801,38 @@ fn device_gpu_honours_max_read_len() {
         assert_eq!(cpu.len(), input.len());
         assert_eq!(cpu, gpu, "flags {extra:?}");
     }
+}
+
+/// `ESCHALIGN_ROW_MAJOR_ONLY` is the documented switch; the name it had inside
+/// escapepod-rs still works as a deprecated alias, and the new name wins
+/// whenever it is set — even to `0`.
+#[test]
+fn row_major_only_switch_and_its_deprecated_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |new: Option<&str>, old: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_eschalign"));
+        c.arg("-v")
+            .arg(input_bam())
+            .arg("-r")
+            .arg(fixtures().join("trna_reference.fa"))
+            .arg("-o")
+            .arg(dir.path().join("out.bam"))
+            .args(["-t", "2"])
+            .env_remove("ESCHALIGN_ROW_MAJOR_ONLY")
+            .env_remove("ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY");
+        if let Some(v) = new {
+            c.env("ESCHALIGN_ROW_MAJOR_ONLY", v);
+        }
+        if let Some(v) = old {
+            c.env("ESCAPEPOD_ALIGN_ROW_MAJOR_ONLY", v);
+        }
+        let o = c.output().unwrap();
+        let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(o.status.success(), "{stderr}");
+        stderr.contains("ROW_MAJOR_ONLY is set")
+    };
+    assert!(!run(None, None));
+    assert!(run(Some("1"), None));
+    assert!(run(None, Some("1")), "deprecated alias is honoured");
+    assert!(!run(Some("0"), Some("1")), "the new name wins");
 }

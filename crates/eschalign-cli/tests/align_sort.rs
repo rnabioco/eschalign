@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! `escpod align --sort coordinate` (#417): the sorted output must be the
+//! `eschalign --sort coordinate` (#417): the sorted output must be the
 //! records of the unsorted output in exactly `samtools sort`'s order — `tid`,
 //! then `pos`, then the reverse flag, then input order, unmapped last — with
 //! the header unchanged apart from `SO` and the `@PG CL`.
@@ -18,10 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("escapepod-classify/tests/fixtures")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 fn input_bam() -> PathBuf {
@@ -32,10 +29,9 @@ fn reference() -> PathBuf {
     fixtures().join("trna_reference.fa")
 }
 
-/// Run `escpod align`, returning stderr.
+/// Run `eschalign`, returning stderr.
 fn align(reads: &Path, reference: &Path, out: &Path, extra: &[&str]) -> String {
-    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("align")
+    let o = Command::new(env!("CARGO_BIN_EXE_eschalign"))
         .arg(reads)
         .arg("-r")
         .arg(reference)
@@ -43,9 +39,9 @@ fn align(reads: &Path, reference: &Path, out: &Path, extra: &[&str]) -> String {
         .arg(out)
         .args(extra)
         .output()
-        .expect("escpod align should launch");
+        .expect("eschalign should launch");
     let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-    assert!(o.status.success(), "escpod align failed:\n{stderr}");
+    assert!(o.status.success(), "eschalign failed:\n{stderr}");
     stderr
 }
 
@@ -74,8 +70,8 @@ fn header_text(h: &sam::Header) -> Vec<String> {
         .map(|l| {
             l.split('\t')
                 .filter(|f| {
-                    !f.starts_with("SO:")
-                        && !(l.starts_with("@PG\tID:escpod-align") && f.starts_with("CL:"))
+                    !(f.starts_with("SO:")
+                        || (l.starts_with("@PG\tID:eschalign") && f.starts_with("CL:")))
                 })
                 .collect::<Vec<_>>()
                 .join("\t")
@@ -107,7 +103,7 @@ fn model_sort(recs: &[RecordBuf]) -> Vec<RecordBuf> {
     v
 }
 
-// SAMTOOLS and PATH are third-party variables, not ESCAPEPOD_* knobs.
+// SAMTOOLS and PATH are third-party variables, not ESCHALIGN_* knobs.
 #[allow(clippy::disallowed_methods)]
 fn samtools() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("SAMTOOLS") {
@@ -206,8 +202,7 @@ fn sort_coordinate_matches_samtools_sort() {
     );
 
     // `-o -`: output starts once input ends, and is the same file.
-    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("align")
+    let o = Command::new(env!("CARGO_BIN_EXE_eschalign"))
         .arg(input_bam())
         .arg("-r")
         .arg(reference())
@@ -395,8 +390,7 @@ fn sort_options_need_sort_coordinate() {
     );
     assert!(e.contains("only apply to --sort coordinate"), "{e}");
     // An unusable --tmp-dir fails before any read is aligned.
-    let o = Command::new(env!("CARGO_BIN_EXE_escpod"))
-        .arg("align")
+    let o = Command::new(env!("CARGO_BIN_EXE_eschalign"))
         .arg(input_bam())
         .arg("-r")
         .arg(reference())

@@ -1,0 +1,52 @@
+[package]
+name = "eschalign-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The `eschalign` binary: all-vs-all alignment of reads to a small reference panel (tRNA), BAM/FASTA/FASTQ in, BAM out"
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+keywords = ["alignment", "bioinformatics", "nanopore", "trna", "cli"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "eschalign"
+path = "src/main.rs"
+# The library of the same name owns the docs.
+doc = false
+
+[dependencies]
+eschalign = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+flate2 = "1"
+indicatif = { workspace = true }
+# Reset SIGPIPE to default so `eschalign … -o - | head` exits quietly.
+libc = "0.2"
+# The global allocator for the binary; see main.rs for the measurement. Its own
+# feature, so a build without it exists to measure against.
+mimalloc = { version = "0.1", optional = true }
+noodles-bam = "0.95"
+noodles-bgzf = "0.51"
+noodles-core = "0.20"
+noodles-sam = "0.90"
+owo-colors = "4"
+rayon = { workspace = true }
+tempfile = "3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+# The CUDA score kernel for panel scoring. Nothing CUDA is needed at build time
+# (cudarc dlopens); at run time it needs the driver and libnvrtc. `--device auto`
+# then places scoring on the GPU when one is visible.
+gpu = ["eschalign/gpu"]
