@@ -105,7 +105,7 @@ pub enum Backend {
 /// The environment variable that caps the dispatch.
 pub const BACKEND_ENV: &str = "ESCHALIGN_BACKEND";
 
-/// The name the cap had inside escapepod-rs (`eschalign`). Still honoured,
+/// The name the cap had inside escapepod-rs (`escpod align`). Still honoured,
 /// but [`BACKEND_ENV`] wins when both are set.
 pub const BACKEND_ENV_DEPRECATED: &str = "ESCAPEPOD_ALIGN_BACKEND";
 
