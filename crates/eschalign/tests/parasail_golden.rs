@@ -4,8 +4,8 @@
 //! `fixtures/align_golden.json` (`fixtures/gen_align_golden.py`): random
 //! nanopore-like pairs and real tRNA reads, both modes, two scoring schemes.
 
-use escapepod_align::alphabet::encode;
-use escapepod_align::{Mode, Scoring, scalar};
+use eschalign::alphabet::encode;
+use eschalign::{Mode, Scoring, scalar};
 use serde_json::Value;
 
 fn golden() -> Value {
@@ -88,22 +88,22 @@ fn cigar_rescores_to_reported_score() {
         let (mut qi, mut rj) = (0usize, 0usize);
         for (op, len) in &a.ops {
             match op {
-                escapepod_align::CigarOp::Match => {
+                eschalign::CigarOp::Match => {
                     qi += *len as usize;
                     rj += *len as usize;
                 }
-                escapepod_align::CigarOp::Ins => qi += *len as usize,
-                escapepod_align::CigarOp::Del => rj += *len as usize,
+                eschalign::CigarOp::Ins => qi += *len as usize,
+                eschalign::CigarOp::Del => rj += *len as usize,
             }
         }
         assert_eq!(qi, a.query_end - a.query_start, "{label}: query span");
         assert_eq!(rj, a.ref_end - a.ref_start, "{label}: reference span");
         assert!(
-            matches!(a.ops.first(), Some((escapepod_align::CigarOp::Match, _))),
+            matches!(a.ops.first(), Some((eschalign::CigarOp::Match, _))),
             "{label}: alignment starts with a gap"
         );
         assert!(
-            matches!(a.ops.last(), Some((escapepod_align::CigarOp::Match, _))),
+            matches!(a.ops.last(), Some((eschalign::CigarOp::Match, _))),
             "{label}: alignment ends with a gap"
         );
     }

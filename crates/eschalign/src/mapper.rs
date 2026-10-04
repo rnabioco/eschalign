@@ -156,7 +156,7 @@ const SCALAR_GROUP: usize = 32;
 
 impl Aligner {
     /// Prepare `panel` with the fastest kernel this machine runs (under any
-    /// `ESCAPEPOD_ALIGN_BACKEND` cap).
+    /// `ESCHALIGN_BACKEND` cap).
     pub fn new(panel: Panel, scoring: Scoring, mode: Mode) -> Result<Self, AlignError> {
         Self::with_backend(panel, scoring, mode, Backend::best())
     }

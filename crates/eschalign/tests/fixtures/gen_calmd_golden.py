@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Measure what `samtools calmd` writes for MD/NM, ambiguity codes included.
 
-`escpod align` must reproduce calmd's MD/NM byte for byte, because the
-waveform charging bundle rebuilds each read's reference from MD
-(`escapepod_classify::waveform::reference_from_md`). What calmd does at a
+`eschalign` must reproduce calmd's MD/NM byte for byte, because escapepod-rs's
+waveform charging classifier rebuilt each read's reference from MD
+(`escapepod_classify::waveform::reference_from_md` there). What calmd does at a
 reference `N` is not documented anywhere we could rely on, so it is measured
 here on a synthetic reference and committed as `calmd_golden.json`.
 

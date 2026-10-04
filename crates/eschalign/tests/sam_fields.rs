@@ -4,8 +4,8 @@
 //! including reference `N` (and other IUPAC, lower-case, `U`) positions —
 //! `fixtures/calmd_golden.json`, from `fixtures/gen_calmd_golden.py`.
 
-use escapepod_align::CigarOp;
-use escapepod_align::sam::{cigar_string, md_nm};
+use eschalign::CigarOp;
+use eschalign::sam::{cigar_string, md_nm};
 use serde_json::Value;
 
 /// Split a SAM CIGAR into its soft clips and aligned ops.

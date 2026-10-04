@@ -4,14 +4,13 @@
 //!
 //! Compiled only with `--features gpu`. Without a usable device (no driver,
 //! no NVRTC, no GPU) the test prints why and passes, so a GPU-less host can
-//! still run `cargo nextest run --features gpu` (the
-//! `escapepod-signal/tests/gpu_dtw.rs` pattern).
+//! still run `cargo nextest run --features gpu`.
 
 #![cfg(feature = "gpu")]
 
-use escapepod_align::alphabet::{encode, reverse_complement_codes};
-use escapepod_align::cuda::{GpuScorer, MAX_READ_LEN, MAX_REF_LEN};
-use escapepod_align::{Mode, Panel, Scoring, scalar};
+use eschalign::alphabet::{encode, reverse_complement_codes};
+use eschalign::cuda::{GpuScorer, MAX_READ_LEN, MAX_REF_LEN};
+use eschalign::{Mode, Panel, Scoring, scalar};
 
 /// Build a scorer, or say why there is no GPU here and return `None`.
 fn scorer(panel: &Panel, scoring: Scoring, mode: Mode) -> Option<GpuScorer> {
@@ -166,12 +165,9 @@ fn check(
 
 fn fixture_panel(fasta: &str) -> Panel {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let file = std::fs::File::open(
-        root.join("../escapepod-classify/tests/fixtures")
-            .join(fasta),
-    )
-    .unwrap();
-    let refs = escapepod_align::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
+    let file =
+        std::fs::File::open(root.join("../eschalign-cli/tests/fixtures").join(fasta)).unwrap();
+    let refs = eschalign::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
     Panel::new(refs).unwrap()
 }
 

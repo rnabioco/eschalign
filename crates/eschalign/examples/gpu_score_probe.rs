@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! samtools view reads.bam | cut -f10 > reads.seq      # one sequence per line
-//! cargo run --release --features gpu -p escapepod-align --example gpu_score_probe -- \
+//! cargo run --release --features gpu -p eschalign --example gpu_score_probe -- \
 //!     panel.fa reads.seq [batch_size] [local|semiglobal]
 //! ```
 //!
@@ -17,9 +17,9 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use escapepod_align::alphabet::encode;
-use escapepod_align::cuda::GpuScorer;
-use escapepod_align::{Mode, Panel, Scoring};
+use eschalign::alphabet::encode;
+use eschalign::cuda::GpuScorer;
+use eschalign::{Mode, Panel, Scoring};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -31,7 +31,7 @@ fn main() {
     let mode: Mode = args.get(4).map_or(Mode::Local, |s| s.parse().unwrap());
 
     let file = std::fs::File::open(&args[1]).unwrap();
-    let refs = escapepod_align::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
+    let refs = eschalign::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
     let panel = Panel::new(refs).unwrap();
     let reads: Vec<Vec<u8>> = std::io::BufReader::new(std::fs::File::open(&args[2]).unwrap())
         .lines()

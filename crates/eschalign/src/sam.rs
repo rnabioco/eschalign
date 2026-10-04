@@ -7,9 +7,9 @@
 //! The scorer treats a reference `N` as matching anything (see
 //! [`crate::alphabet`]). `MD` and `NM` do **not**: they are what
 //! `samtools calmd` writes for the same CIGAR, because the pipeline this
-//! replaces ran calmd and `escpod classify`'s windowed charging bundle
-//! rebuilds each read's reference from `MD`
-//! (`escapepod_classify::waveform::reference_from_md`). A reference `N` that
+//! replaces ran calmd and escapepod-rs's windowed charging classifier
+//! rebuilt each read's reference from `MD`
+//! (`escapepod_classify::waveform::reference_from_md` there). A reference `N` that
 //! vanished from `MD` would put the read's own base in its place, and #306 was
 //! exactly a reference-`N` mishap that cost 169/256 chunks their bit-exactness.
 //!

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Generate align_golden.json: parasail's scores and coordinates, the oracle
-for escapepod-align's scalar Gotoh (tests/parasail_golden.rs).
+for eschalign's scalar Gotoh (tests/parasail_golden.rs).
 
 parasail's `sw_trace` (local) and `sg_trace` (semi-global: leading and
 trailing gaps of both sequences free) are the reference implementations. Its
-open/extend convention is escapepod-align's with the signs flipped: a gap of
+open/extend convention is eschalign's with the signs flipped: a gap of
 length k costs `open + (k - 1) * extend`, so `Scoring { gap_open: -10,
 gap_extend: -1 }` is parasail's `open=10, extend=1`.
 
 The substitution matrix is ACGTN with N as a wildcard (N pairs with anything
-as a match), which is escapepod-align's rule for every non-ACGT letter.
+as a match), which is eschalign's rule for every non-ACGT letter.
 
 Recorded per (pair, mode, scheme): score, and 0-based half-open
 query/reference coordinates of the aligned region. parasail reports the end
@@ -21,14 +21,14 @@ Usage, from aa-tRNA-seq-pipeline (parasail-python 1.3.x in its pixi env):
 
     cd ~/devel/rnabioco/aa-tRNA-seq-pipeline
     pixi run python <this> --samtools .pixi/envs/default/bin/samtools \
-        > crates/escapepod-align/tests/fixtures/align_golden.json
+        > crates/eschalign/tests/fixtures/align_golden.json
 """
 import argparse, json, os, random, re, subprocess, sys
 
 import parasail
 
 SCHEMES = {
-    # gpu-tRNA-mapper's default, and escpod align's.
+    # gpu-tRNA-mapper's default, and eschalign's.
     "default": (2, -1, -10, -1),
     # bwa mem -x ont2d's scores in this convention (bwa's O=1,E=1 is a
     # 1-base gap of -2): gap-lenient.
@@ -36,7 +36,7 @@ SCHEMES = {
 }
 MODES = {"local": parasail.sw_trace, "semiglobal": parasail.sg_trace}
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLASSIFY_FIXTURES = os.path.join(HERE, "../../../escapepod-classify/tests/fixtures")
+CLASSIFY_FIXTURES = os.path.join(HERE, "../../../eschalign-cli/tests/fixtures")
 
 
 def matrix(m, x):
@@ -126,7 +126,7 @@ def main():
         pairs.append({"source": "random", "name": f"random_{k}", "query": query,
                       "reference": ref, "results": results(query, ref)})
 
-    # Real reads from escapepod-classify's fixture BAM, against the reference
+    # Real reads from the fixture BAM, against the reference
     # bwa assigned them, from both the plain and the N-carrying FASTA.
     bam = os.path.join(CLASSIFY_FIXTURES, "trna_mappings_padded.bam")
     sam = subprocess.run([a.samtools, "view", bam], capture_output=True, text=True,

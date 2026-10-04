@@ -69,9 +69,10 @@
 //!
 //! # Dispatch
 //!
-//! In the style of `escapepod_signal::lstm`: runtime `is_x86_feature_detected!`
+//! Runtime `is_x86_feature_detected!`
 //! (never a baseline bump), kernels `#[inline(never)]`, and
-//! `ESCAPEPOD_ALIGN_BACKEND=scalar|avx2|avx512` capping the choice for A/Bs.
+//! `ESCHALIGN_BACKEND=scalar|avx2|avx512` capping the choice for A/Bs
+//! (`ESCAPEPOD_ALIGN_BACKEND` is a deprecated alias).
 //! Tests sweep [`Backend::available`], not the one the dispatch prefers.
 
 #[cfg(target_arch = "x86_64")]
@@ -102,7 +103,11 @@ pub enum Backend {
 }
 
 /// The environment variable that caps the dispatch.
-pub const BACKEND_ENV: &str = "ESCAPEPOD_ALIGN_BACKEND";
+pub const BACKEND_ENV: &str = "ESCHALIGN_BACKEND";
+
+/// The name the cap had inside escapepod-rs (`eschalign`). Still honoured,
+/// but [`BACKEND_ENV`] wins when both are set.
+pub const BACKEND_ENV_DEPRECATED: &str = "ESCAPEPOD_ALIGN_BACKEND";
 
 /// Reads at least this long are scored with the reference-major
 /// ([`Kernel::Transposed`]) kernel by default; shorter ones with the
@@ -156,7 +161,7 @@ impl Backend {
         }
     }
 
-    /// Parse a kernel name as `ESCAPEPOD_ALIGN_BACKEND` spells it.
+    /// Parse a kernel name as `ESCHALIGN_BACKEND` spells it.
     pub fn from_name(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|b| b.name() == s)
     }
@@ -180,14 +185,15 @@ impl Backend {
         Self::ALL.into_iter().filter(|b| b.supported()).collect()
     }
 
-    /// The cap `ESCAPEPOD_ALIGN_BACKEND` sets: `Ok(None)` when unset,
+    /// The cap `ESCHALIGN_BACKEND` (or its deprecated alias `ESCAPEPOD_ALIGN_BACKEND`) sets: `Ok(None)` when unset,
     /// `Err(value)` when it names no kernel (the caller decides whether to
     /// warn; this crate does not log).
     pub fn cap_from_env() -> Result<Option<Backend>, String> {
         // `*_BACKEND` caps are a name, not a flag/knob shape, and keep their
         // own parse (root CLAUDE.md's env-switch table).
         #[allow(clippy::disallowed_methods)]
-        match std::env::var(BACKEND_ENV) {
+        let var = std::env::var(BACKEND_ENV).or_else(|_| std::env::var(BACKEND_ENV_DEPRECATED));
+        match var {
             Err(_) => Ok(None),
             Ok(v) => Self::from_name(v.trim()).map(Some).ok_or(v),
         }
@@ -228,7 +234,7 @@ pub(crate) struct Group {
     pub(crate) prof: Vec<i16>,
     /// The transposed kernel's profile, built from `prof` the first time that
     /// kernel runs on this group (see [`Group::tprof`]) — at the defaults of
-    /// `escpod align` it never does, and the copy would double the profile.
+    /// `eschalign` it never does, and the copy would double the profile.
     tprof: OnceLock<Vec<i16>>,
     /// `ends[j]`: bit `lane` set when column `j` is that lane's last.
     pub(crate) ends: Vec<u32>,
@@ -798,7 +804,7 @@ mod tests {
     }
 
     /// Every backend the machine has, on the real tRNA reads and the real
-    /// 47-reference panel from escapepod-classify's fixtures (reads taken from
+    /// 47-reference panel from the CLI crate's tRNA fixtures (reads taken from
     /// this crate's golden, which carries them as plain strings).
     #[test]
     fn simd_matches_scalar_on_fixture_reads() {
@@ -816,11 +822,9 @@ mod tests {
             .collect();
         assert!(reads.len() >= 5, "golden carries too few fixture reads");
         for fasta in ["trna_reference.fa", "trna_reference_ambiguous.fa"] {
-            let file = std::fs::File::open(
-                root.join("../escapepod-classify/tests/fixtures")
-                    .join(fasta),
-            )
-            .unwrap();
+            let file =
+                std::fs::File::open(root.join("../eschalign-cli/tests/fixtures").join(fasta))
+                    .unwrap();
             let refs = crate::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
             let panel = Panel::new(refs).unwrap();
             assert_eq!(panel.len(), 47);
@@ -1009,11 +1013,9 @@ mod tests {
             .collect();
         assert!(reads.len() >= 5, "golden carries too few fixture reads");
         for fasta in ["trna_reference.fa", "trna_reference_ambiguous.fa"] {
-            let file = std::fs::File::open(
-                root.join("../escapepod-classify/tests/fixtures")
-                    .join(fasta),
-            )
-            .unwrap();
+            let file =
+                std::fs::File::open(root.join("../eschalign-cli/tests/fixtures").join(fasta))
+                    .unwrap();
             let refs = crate::fasta::read_fasta(std::io::BufReader::new(file)).unwrap();
             let panel = Panel::new(refs).unwrap();
             for scoring in transposed_schemes() {

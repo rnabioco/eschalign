@@ -6,8 +6,8 @@
 //! (rnabioco/escapepod-rs#415). Keep it re-runnable.
 //!
 //! ```text
-//! cargo run --release -p escapepod-align --example long_read_probe
-//! cargo run --release -p escapepod-align --example long_read_probe -- \
+//! cargo run --release -p eschalign --example long_read_probe
+//! cargo run --release -p eschalign --example long_read_probe -- \
 //!     --reference sacCer3-mature-tRNAs-dual-adapt-v2.fa --reads long_read.fa --split
 //! ```
 //!
@@ -17,7 +17,7 @@
 //! 16 k, 64 k, 256 k and 400 k nt) — the DP's cost does not depend on the
 //! bases. With `--reads FASTA` each record is timed instead. `--split` also
 //! times each read's lane groups on one thread per group (`std::thread`),
-//! the way `escpod align` spreads a long read over its pool.
+//! the way `eschalign` spreads a long read over its pool.
 //!
 //! Output is TSV on stdout: backend, kernel, read length, seconds per read,
 //! cells/s (read length × panel bases, the useful cells), and for `--split`
@@ -25,9 +25,9 @@
 
 use std::time::{Duration, Instant};
 
-use escapepod_align::alphabet::encode;
-use escapepod_align::simd::Kernel;
-use escapepod_align::{Aligner, Backend, Mode, Panel, Scoring};
+use eschalign::alphabet::encode;
+use eschalign::simd::Kernel;
+use eschalign::{Aligner, Backend, Mode, Panel, Scoring};
 
 fn xorshift(x: &mut u64) -> u64 {
     *x ^= *x << 13;
@@ -77,7 +77,7 @@ fn main() {
     }
     let read_fasta = |path: &str| {
         let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        escapepod_align::fasta::read_fasta(std::io::BufReader::new(f)).expect("FASTA")
+        eschalign::fasta::read_fasta(std::io::BufReader::new(f)).expect("FASTA")
     };
     let mut x = 0x0123_4567_89ab_cdefu64;
     let panel = match &reference {

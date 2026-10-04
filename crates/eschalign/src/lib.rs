@@ -11,7 +11,7 @@
 //! range is **≤ ~10 k references of ≤ ~1 kb**; nothing here seeds, so a larger
 //! panel is simply proportionally slower.
 //!
-//! Written from rnabioco/escapepod-rs#395. The functional model is
+//! Carved out of escapepod-rs (where it was written for rnabioco/escapepod-rs#395). The functional model is
 //! gpu-tRNA-mapper (every read against every reference, ties explicit,
 //! tracebacks for winners only); none of its code is reproduced. Its design
 //! was reviewed for #415 (nothing ported): its semi-global DP is the same
@@ -44,8 +44,7 @@
 //! This crate depends on nothing but `std` (plus cudarc under `gpu`) and does
 //! no file I/O of its own; reading BAM and FASTQ, and opening a (possibly
 //! gzipped) FASTA file before handing it to [`fasta::read_fasta`], is
-//! `escapepod-cli`'s job (`escpod align`) — `escapepod-classify` does the same
-//! for its own reference-FASTA callers.
+//! `eschalign-cli`'s job.
 
 pub mod alphabet;
 #[cfg(feature = "gpu")]

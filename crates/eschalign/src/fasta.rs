@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: MIT
 
-//! The one reference FASTA reader (rnabioco/escapepod-rs#410).
+//! The one reference FASTA reader (history: rnabioco/escapepod-rs#410).
 //!
-//! Before this, the reference FASTA was parsed in six places — this crate's
-//! own `escpod align` caller, `escapepod-classify`'s `geometry::read_fasta`,
-//! and four tests/examples — each a slightly different ad hoc loop, and two
-//! of them (`escpod align` and `escpod classify`) already disagreed on the
-//! same file: `align` read a gzipped reference and refused a duplicate name,
-//! `classify` failed on gzip and let a duplicate silently win. [`read_fasta`]
+//! Before this, in escapepod-rs, the reference FASTA was parsed in six
+//! places, each a slightly different ad hoc loop, and two of them (the
+//! aligner and the charging classifier) already disagreed on the same file:
+//! the aligner read a gzipped reference and refused a duplicate name, the
+//! classifier failed on gzip and let a duplicate silently win. [`read_fasta`]
 //! is the rule every caller now goes through instead of writing its own.
 //!
 //! Deliberately **not** the whole story: this function takes an
 //! already-open [`BufRead`], so gzip detection and file opening stay out of
 //! this std-only, `cargo publish`-able crate. A caller that wants to accept
 //! a gzipped reference wraps `flate2::read::MultiGzDecoder` itself first
-//! (`escapepod-cli`'s `align.rs::open_text` is the canonical shape).
+//! (`eschalign-cli`'s `align.rs::open_text` is the canonical shape).
 
 use std::collections::HashSet;
 use std::io::BufRead;
@@ -38,8 +37,8 @@ use crate::AlignError;
 ///   nothing but blank lines before it (leading blank lines are tolerated).
 ///
 /// Case is preserved exactly as written; nothing here upper-cases a sequence
-/// or a name — a caller that wants that (as `escapepod-classify`'s geometry
-/// lookup does) applies it to this function's output.
+/// or a name — a caller that wants that (as a case-insensitive geometry
+/// lookup would) applies it to this function's output.
 pub fn read_fasta<R: BufRead>(mut reader: R) -> Result<Vec<(String, Vec<u8>)>, AlignError> {
     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();

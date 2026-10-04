@@ -1,18 +1,18 @@
 [package]
-name = "escapepod-align"
+name = "eschalign"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "All-vs-all read-to-reference alignment for small reference panels (tRNA): affine-gap local and overlap DP, scored with AVX2/AVX-512 inter-sequence kernels, with SAM CIGAR/MD/NM for the winners."
 readme.workspace = true
+publish.workspace = true
 repository.workspace = true
 license.workspace = true
 keywords = ["alignment", "bioinformatics", "nanopore", "smith-waterman", "trna"]
 categories = ["algorithms", "science"]
 
-# A leaf crate on purpose: std only, no noodles, no git dependencies, so it
-# stays `cargo publish`-able. All BAM/FASTA/FASTQ I/O lives in escapepod-cli,
-# the same split escapepod-classify keeps. The one optional dependency is
+# A leaf crate on purpose: std only, no noodles, no git dependencies. All
+# BAM/FASTA/FASTQ I/O lives in eschalign-cli. The one optional dependency is
 # cudarc, for the `gpu` feature below.
 [dependencies]
 cudarc = { workspace = true, optional = true }
@@ -22,7 +22,7 @@ default = []
 # The CUDA score kernel (`cuda::GpuScorer`): one thread per (read, reference)
 # pair, NVRTC-compiled at run time. cudarc's `dynamic-loading` means nothing
 # CUDA is needed to build; at run time it needs the CUDA driver and libnvrtc.
-# escapepod-cli's atomic `gpu` feature forwards here.
+# eschalign-cli's `gpu` feature forwards here.
 gpu = ["dep:cudarc"]
 
 [dev-dependencies]

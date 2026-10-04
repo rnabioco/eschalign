@@ -10,7 +10,7 @@
 //! differ if a score does, and the scores are pinned to [`crate::scalar::score`]
 //! by equality (`tests/gpu_parity.rs`).
 //!
-//! Mirrors `escapepod_signal::dtw::cuda`: the kernel is a source string
+//! Same pattern as escapepod-rs's CUDA DTW kernel: the kernel is a source string
 //! compiled by NVRTC when the scorer is built, cudarc loads the driver and
 //! NVRTC with `dlopen` (its `dynamic-loading` feature), so nothing CUDA is
 //! needed at build time, and a machine without either gets an error from
@@ -31,7 +31,7 @@
 //! does; a real sample carries reads of 50–400 kb (0.5–6 s each on one block)
 //! among ~10⁵ reads of ~130 nt. Past 4 kb — some 30× the median tRNA read —
 //! a read costs one block longer than the whole rest of a 50 k-read batch is
-//! likely to take, so it goes to the CPU instead, where `escpod align`
+//! likely to take, so it goes to the CPU instead, where `eschalign`
 //! already gives such a read a chunk of its own.
 //!
 //! The cap on *reference* length is the shared-memory budget: the panel is
@@ -71,6 +71,24 @@ const SMEM_BUDGET: usize = 48 * 1024;
 
 /// Most threads (references) per block.
 const MAX_LANES: usize = 256;
+
+/// Whether at least one CUDA device is visible to this process, cached for the
+/// process. `false` when the driver library cannot be loaded at all.
+///
+/// Cached because the answer cannot change mid-process (SLURM does not hand a
+/// job a GPU it did not allocate) and `cuDeviceGetCount` implies `cuInit`,
+/// which is tens of milliseconds the first time.
+pub fn device_visible() -> bool {
+    static VISIBLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VISIBLE.get_or_init(|| {
+        // Safety: only attempts to `dlopen` a shared library by name and
+        // reports whether that succeeded; no pointers from it are dereferenced.
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            return false;
+        }
+        CudaContext::device_count().is_ok_and(|n| n > 0)
+    })
+}
 
 /// Why the GPU scorer could not be built or run.
 #[derive(Debug)]
@@ -127,7 +145,7 @@ fn mask(code: u8) -> u32 {
 ///
 /// Build once per run: construction compiles the kernel (NVRTC) and uploads
 /// the panel. [`GpuScorer::score_batch`] takes `&mut self` because every
-/// launch reuses one scratch buffer; `escpod align` gives the scorer a
+/// launch reuses one scratch buffer; `eschalign` gives the scorer a
 /// dedicated thread.
 pub struct GpuScorer {
     ctx: Arc<CudaContext>,
