@@ -1,0 +1,226 @@
+name: Release
+
+# Pushing a `vX.Y.Z` tag builds the Linux binaries and publishes a GitHub
+# Release. No macOS artifacts: nothing here targets it.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Read-only by default; only the `release` job that publishes is granted write.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fail in seconds, before any build, if the tag and the crate disagree or the
+  # changelog has no section for it.
+  verify:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml and CHANGELOG.md
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -1)
+          if [ "$crate" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME but workspace version is $crate"
+            exit 1
+          fi
+          if ! grep -qE "^## \[?${version//./\\.}\]?( |$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## $version' section"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ubuntu-latest
+    # aarch64-musl also compiles `cross` from git first.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86-64-v3 (AVX2/FMA/BMI2) is the pinned baseline; the AVX-512
+          # kernels are runtime-dispatched, so it is portable across x86_64
+          # nodes. Never `native`.
+          - target: x86_64-unknown-linux-musl
+            rustflags: "-C target-cpu=x86-64-v3"
+            use_cross: false
+          - target: aarch64-unknown-linux-musl
+            rustflags: ""
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins 1.95; install that, not `stable`, so the
+      # target lands on the toolchain cargo will actually use.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --profile dist --target ${{ matrix.target }} -p eschalign-cli
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --profile dist --target ${{ matrix.target }} -p eschalign-cli
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/dist
+          tar czvf ../../../eschalign-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz eschalign
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: eschalign-${{ matrix.target }}
+          path: eschalign-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  # The GPU artifact is its own job: the only build that needs a container, is
+  # dynamically linked, and carries a feature flag. It cannot be musl, because
+  # cudarc dlopens the CUDA driver, which a static binary cannot do. Nothing
+  # CUDA is needed at build time, so a runner with no GPU builds it.
+  #
+  # manylinux_2_28 (AlmaLinux 8) puts the glibc floor in the image name, so a
+  # rolling tag cannot raise it. The cluster nodes are RHEL 9 (glibc 2.34).
+  build-gpu:
+    name: Build x86_64-unknown-linux-gnu-gpu
+    needs: verify
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      NAME: x86_64-unknown-linux-gnu-gpu
+    steps:
+      - uses: actions/checkout@v7
+
+      # rustup directly: inside a container the toolchain action's PATH
+      # handling is one more thing to be wrong. 1.95 as rust-toolchain.toml.
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.95
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --profile dist --target "$TARGET" -p eschalign-cli --features gpu
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
+
+      # Asserted off the binary rather than assumed from the image, so a base
+      # bump fails the release instead of shipping something that will not
+      # start on the machines that asked for it.
+      - name: Assert glibc floor
+        run: |
+          set -euo pipefail
+          # `-T` reads .dynsym, which survives the dist profile's strip.
+          max=$(objdump -T "target/$TARGET/dist/eschalign" \
+                | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)
+          echo "highest required glibc symbol version: ${max:-<none>}"
+          if [ -z "$max" ]; then
+            echo "::error::no versioned glibc symbols found — the probe is broken"
+            exit 1
+          fi
+          if [ "$(printf '%s\n2.34\n' "$max" | sort -V | tail -1)" != "2.34" ]; then
+            echo "::error::eschalign needs glibc $max, above the 2.34 floor (RHEL 9)"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd "target/$TARGET/dist"
+          tar czvf "../../../eschalign-${GITHUB_REF_NAME}-${NAME}.tar.gz" eschalign
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: eschalign-x86_64-unknown-linux-gnu-gpu
+          path: eschalign-${{ github.ref_name }}-x86_64-unknown-linux-gnu-gpu.tar.gz
+
+  release:
+    name: Create Release
+    needs: [build, build-gpu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum eschalign-* > SHA256SUMS.txt
+
+      - name: Extract changelog for this version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The section between this version's header and the next.
+          body=$(awk -v ver="$version" '
+            /^## / { if (found) exit; if (index($0, ver)) found=1; next }
+            found { print }
+          ' CHANGELOG.md)
+          if [ -z "${body//[[:space:]]/}" ]; then
+            echo "::warning::No CHANGELOG.md section matched $version"
+            body="Release $GITHUB_REF_NAME. See CHANGELOG.md for details."
+          fi
+          echo "$body" > release_notes.md
+
+      - name: Append artifact guide to release notes
+        run: |
+          cat >> release_notes.md <<'EOF'
+
+          ---
+
+          ### Which artifact
+
+          | Artifact | Linkage | `--device gpu` |
+          |---|---|---|
+          | `…-x86_64-unknown-linux-musl.tar.gz` | static (musl) | no |
+          | `…-aarch64-unknown-linux-musl.tar.gz` | static (musl) | no |
+          | `…-x86_64-unknown-linux-gnu-gpu.tar.gz` | dynamic, glibc ≥ 2.28 | **yes** |
+
+          The **musl** builds are the portable default. GPU scoring `dlopen`s the
+          CUDA driver, which a static binary cannot do, so it ships only in the
+          dynamically linked `…-linux-gnu-gpu` artifact (RHEL/Rocky/Alma 8+,
+          Ubuntu 20.04+). Without a visible GPU it behaves exactly like the
+          musl build, and `--device cpu` forces the CPU. Output is
+          byte-identical either way. Verify downloads against `SHA256SUMS.txt`.
+          EOF
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          body_path: release_notes.md
+          files: artifacts/*
