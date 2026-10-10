@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0
+
 ### Added
 
 - **Paired-end alignment** (#1). `-1 R1 -2 R2`, `--interleaved`, or a BAM of
