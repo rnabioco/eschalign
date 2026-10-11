@@ -1,0 +1,73 @@
+[project]
+site_name = "eschalign"
+site_description = "All-vs-all read-to-reference aligner for small reference panels (tRNA)"
+site_url = "https://rnabioco.github.io/eschalign/"
+repo_url = "https://github.com/rnabioco/eschalign"
+repo_name = "rnabioco/eschalign"
+copyright = "Copyright &copy; 2025 RNA Bioscience Initiative"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Installation" = "installation.md" },
+  { "Usage" = "align.md" },
+  { "GPU" = "gpu.md" },
+  { "Benchmarks" = "benchmarks.md" },
+  { "Development" = "development.md" },
+  { "Changelog" = "changelog.md" },
+]
+
+[project.theme]
+features = [
+  "navigation.sections",
+  "navigation.expand",
+  "navigation.top",
+  "navigation.indexes",
+  "search.suggest",
+  "search.highlight",
+  "content.code.copy",
+  "content.code.annotate",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to light mode"
+
+[project.markdown_extensions.pymdownx.highlight]
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+
+# `--8<-- "CHANGELOG.md"` in docs/changelog.md includes the repo-root file, so
+# the page cannot drift from it. base_path is relative to the working directory
+# (the repo root, where zensical runs).
+[project.markdown_extensions.pymdownx.snippets]
+base_path = ["."]
+
+[project.markdown_extensions.pymdownx.superfences]
+
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.admonition]
+
+[project.markdown_extensions.tables]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/rnabioco/eschalign"
+name = "eschalign on GitHub"
