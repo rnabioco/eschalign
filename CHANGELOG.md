@@ -12,6 +12,14 @@
   5.3–5.7e11 cells/s against 2.6–3.0e11 (`examples/gpu_score_probe.rs`,
   `benchmarks/README.md`). Library: `cuda::fits_f16`, `cuda::MAX_REF_LEN_H2`,
   `GpuScorer::{set_half2, half2, half2_scores_len, geometry_h2, registers_h2}`.
+- The half2 kernel's last stripe is now the narrowest of 16, 8 or 4 rows
+  that covers the read's remaining rows (#13), as the int kernel's has been
+  since #11, so a 130 nt read computes 132 rows rather than 144. On an A30,
+  130 nt reads score 1.09× faster in local mode and 1.11× in semi-global
+  (5.5e11 / 6.2e11 cells/s), all of M1 1.04× / 1.07×; output is
+  byte-identical and the kernel stays at 80 registers. Library:
+  `GpuScorer::{local_bytes, local_bytes_h2}` report each kernel's local
+  memory per thread (spills), and `examples/gpu_score_probe.rs` prints them.
 
 ## 0.2.0
 

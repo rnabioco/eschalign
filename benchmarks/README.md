@@ -4,6 +4,65 @@ Carved out of escapepod-rs 0.31.0. The sections below are that repository's `esc
 
 The harness is `benchmarks/benchmark_align.sh`; see its header for the flags.
 
+## `eschalign --device gpu`: narrow tail stripe in the half2 kernel (2026-10-17, #13)
+
+The half2 kernel below walked a full, masked 16-row stripe for the end of
+every read, so a 130 nt read paid for 144 rows. The int kernel's last stripe
+has been a template on `RR ∈ {16, 8, 4}` since #11 (`rows ≤ 4 → 4`, `≤ 8 →
+8`); this ports that dispatch to `stripe2`, so the 130 nt read computes 132
+rows. Output is byte-identical (`gpu_parity` on both kernels, both modes,
+five schemes, every read length 1–40 around the stripe; a deliberately
+broken dispatch — `rows ≤ 8` sent to the 4-row stripe — fails three of its
+five tests).
+
+**The kernel alone** (`examples/gpu_score_probe.rs`, `score_batch` on M1's
+reads against the 164-reference panel, `srun -p gpu -A gpu_rbi -c 16
+--gres=gpu:1`, one A30, batch 50,000, default scoring, `auto` — every read
+here is inside `fits_f16`, so all of them on the half2 kernel; `base` =
+`main` at `332aba6`, `tail` = this change, arms interleaved per row, two reps
+each within 0.3%; cells/s = read length × panel bases). The fixed-length sets
+are M1 reads of at least that length truncated to it, 100,000 each:
+
+| reads | tail rows (stripe) | local `base` | local `tail` | × | semi-global `base` | semi-global `tail` | × |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 100 nt | 4 (4) | 5.02e11 | **5.57e11** | 1.11 | 5.48e11 | **6.21e11** | 1.13 |
+| 112 nt | 16 (16) | 5.61e11 | 5.62e11 | 1.00 | 6.12e11 | 6.30e11 | 1.03 |
+| 120 nt | 8 (8) | 5.27e11 | **5.59e11** | 1.06 | 5.75e11 | **6.27e11** | 1.09 |
+| 128 nt | 16 (16) | 5.61e11 | 5.63e11 | 1.00 | 6.13e11 | 6.31e11 | 1.03 |
+| **130 nt** | 2 (4) | 5.07e11 | **5.51e11** | **1.09** | 5.55e11 | **6.16e11** | **1.11** |
+| 136 nt | 8 (8) | 5.30e11 | **5.60e11** | 1.06 | 5.80e11 | **6.28e11** | 1.08 |
+| 144 nt | 16 (16) | 5.60e11 | 5.63e11 | 1.00 | 6.12e11 | 6.33e11 | 1.03 |
+| 160 nt | 16 (16) | 5.60e11 | 5.62e11 | 1.00 | 6.13e11 | 6.32e11 | 1.03 |
+| M1, 100–200 nt (352,573) | — | 5.28e11 | **5.49e11** | 1.04 | 5.77e11 | **6.15e11** | 1.07 |
+| M1, all (489,620 on the GPU) | — | 5.25e11 | **5.48e11** | 1.04 | 5.74e11 | **6.13e11** | 1.07 |
+
+(In seconds, all of M1: 2.61 → 2.50 local, 2.39 → 2.24 semi-global.) The
+gain tracks the rows saved: 100 and 130 nt (12 rows of 144 and 132) gain
+the most, 120 and 136 nt (8 of 136) the middle, and the lengths whose tail
+is already 16 rows are within noise in local mode and ~3% ahead in
+semi-global, where only the dispatch and the JIT's schedule of the 16-row
+tail differ. A 2-row stripe for the 130 nt case would save 2 rows of 132
+and was not tried.
+
+**Registers.** `__launch_bounds__(256, 3)` is untouched and the half2
+kernel stays at 80 registers; its local memory per thread goes 56 → 72 B
+(the int kernel holds 120 B at 64 registers; `GpuScorer::{local_bytes,
+local_bytes_h2}`, new, printed by the probe) — the extra stripe
+instantiations cost 16 B of spill somewhere off the hot loop, and every row
+above is faster or equal for it.
+
+Reproduce:
+
+```bash
+samtools view M1.rbc.bam | cut -f10 > M1.seq
+for L in 100 112 120 128 130 136 144 160; do
+    awk -v L=$L 'length($0) >= L { print substr($0, 1, L); if (++c >= 100000) exit }' M1.seq > L$L.seq
+done
+srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 -- \
+    pixi run -e dev-gpu cargo run --release --features gpu -p eschalign \
+    --example gpu_score_probe -- panel.fa L130.seq 50000 local auto   # or: semiglobal
+```
+
 ## `eschalign --device gpu`: half2 score kernel, two references per thread (2026-10-17, #9)
 
 The int kernel below (one reference per thread, `int` arithmetic) is
@@ -38,9 +97,9 @@ inside `fits_f16` on the half2 kernel — all of them here):
 seconds, all of M1: 5.32 → 2.61 local, 4.63 → 2.39 semi-global.) Before #11
 the int kernel was 2.45e11 / 2.83e11 at 100–200 nt (2.44 / 2.82e11 on all of
 M1; 5.61 / 4.87 s), so the half2 kernel's margin over the kernel the spike
-was gated against was 2.15× / 2.04×; its tail stripe is still a full 16
-rows, and porting #11's `RR ∈ {16, 8, 4}` dispatch to it is the obvious next
-step. The int kernel itself is untouched by this change: compiling the
+was gated against was 2.15× / 2.04×; its tail stripe was still a full 16
+rows here, and porting #11's `RR ∈ {16, 8, 4}` dispatch to it is the section
+above (#13). The int kernel itself is untouched by this change: compiling the
 module for `compute_80` instead of NVRTC's default target moved it by
 nothing.
 

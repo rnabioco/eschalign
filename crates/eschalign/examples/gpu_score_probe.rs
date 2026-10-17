@@ -50,15 +50,17 @@ fn main() {
     gpu.set_half2(half2);
     let (lanes, groups, blocks) = gpu.geometry();
     println!(
-        "{}: int kernel {groups} group(s) x {blocks} blocks x {lanes} threads, {:?} registers, ready in {:.2} s",
+        "{}: int kernel {groups} group(s) x {blocks} blocks x {lanes} threads, {:?} registers, {:?} B local, ready in {:.2} s",
         gpu.device_name(),
         gpu.registers(),
+        gpu.local_bytes(),
         t0.elapsed().as_secs_f64()
     );
     match gpu.geometry_h2() {
         Some((lanes, groups, blocks)) => println!(
-            "half2 kernel {groups} group(s) x {blocks} blocks x {lanes} threads, {:?} registers, {}",
+            "half2 kernel {groups} group(s) x {blocks} blocks x {lanes} threads, {:?} registers, {:?} B local, {}",
             gpu.registers_h2(),
+            gpu.local_bytes_h2(),
             if gpu.half2() { "in use" } else { "off" }
         ),
         None => println!("half2 kernel: not available on this device for this panel"),
