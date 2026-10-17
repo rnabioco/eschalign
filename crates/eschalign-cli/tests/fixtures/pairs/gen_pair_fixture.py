@@ -65,6 +65,8 @@ add("wrong_orientation", u2[0:50], u2[100:150])
 add("one_unmapped", u2[20:80], rand(60))
 # An ordinary pair.
 add("plain", u2[10:70], rc(u2[80:140]))
+# Discordant: mate 1 comes from U1, mate 2 from U2 (each an unambiguous best).
+add("discordant", u1[10:70], rc(u2[80:140]))
 
 
 def qual(n, shift):
