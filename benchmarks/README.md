@@ -4,6 +4,29 @@ Carved out of escapepod-rs 0.31.0. The sections below are that repository's `esc
 
 The harness is `benchmarks/benchmark_align.sh`; see its header for the flags.
 
+Criterion benchmarks (`crates/eschalign/benches/`) give a confidence interval
+for kernel changes on the same synthetic 164-reference panel the probes use.
+Run them in an allocation, not on the login node; `[profile.bench]` inherits
+release, so they match the shipped codegen. Criterion's own output
+(`target/criterion`) stays in the build directory, so point `CARGO_TARGET_DIR`
+under `~/scratch/<topic>/` and delete it after.
+
+```bash
+# CPU: score_all (backend x mode x read length), loop_order, map_reads (64-read chunk)
+srun -p rna -c 32 --mem=32G -- pixi run -e dev cargo bench -p eschalign --bench kernels
+cargo bench -p eschalign --bench kernels -- score_all/local/avx512   # a filter
+# GPU: score_batch, int against half2, local and semi-global
+srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 -- \
+    pixi run -e dev-gpu cargo bench --features gpu -p eschalign --bench gpu
+# compare against a baseline: cargo bench ... -- --save-baseline main, then --baseline main
+```
+
+First numbers (2026-10-17, v0.3.0, one thread, 130 nt, local): avx2 8.0e9
+cells/s and avx512 1.20e10 on rna; the A30 scores 2.66e11 on the int kernel and
+5.68e11 on half2 (20,000-read batches). These agree with the probes below.
+`examples/{long_read_probe,gpu_score_probe}.rs` remain the tools for real reads,
+very long reads and register counts.
+
 ## `eschalign --device gpu`: narrow tail stripe in the half2 kernel (2026-10-17, #13)
 
 The half2 kernel below walked a full, masked 16-row stripe for the end of

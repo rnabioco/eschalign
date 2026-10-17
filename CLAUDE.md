@@ -111,7 +111,10 @@ beside wall — the lessons of benchmarking on BeeGFS, where the first arm to
 touch a file pays to page it in. Output goes to node-local scratch and is
 deleted. The numbers carried over from escapepod-rs are in `benchmarks/README.md`.
 `crates/eschalign/examples/{long_read_probe,gpu_score_probe}.rs` are the
-kernel-level probes; keep them re-runnable. Benchmark output belongs under
+kernel-level probes; keep them re-runnable. `cargo bench -p eschalign --bench
+kernels` (and `--bench gpu` with `--features gpu`) are the criterion versions,
+for a before/after with a confidence interval (`benchmarks/README.md`).
+Benchmark output belongs under
 `results/` or `~/scratch/<topic>/`, never `~/.cache`.
 
 ```bash

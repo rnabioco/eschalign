@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- Criterion benchmarks (`crates/eschalign/benches/`): `kernels` (score per
+  backend, mode and read length; row-major against reference-major; a 64-read
+  `map_reads` chunk) and `gpu` (`score_batch`, int against half2; needs
+  `--features gpu` and a device, skips without one). `criterion` is a
+  dev-dependency only; the library is still std-only.
+
 ## 0.3.0
 
 ### Changed
