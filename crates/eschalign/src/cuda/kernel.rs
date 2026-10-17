@@ -61,23 +61,22 @@ pub(crate) const KERNEL_SRC: &str = r#"
 #define NEG (-(1 << 29))
 #define R 16
 
-template <bool LOCAL, bool TAIL>
+template <bool LOCAL, bool TAIL, int RR>
 __device__ __forceinline__ void stripe(
     const unsigned int* __restrict__ sp, int lanes, int t, int m,
     unsigned int q0, unsigned int q1, int rows, bool first,
     unsigned int* __restrict__ bnd, size_t bstride,
     int ma, int mi, int o, int e, int& best)
 {
-    int qm[R];
+    int qm[RR];
 #pragma unroll
-    for (int r = 0; r < 8; r++) {
-        qm[r] = (q0 >> (4 * r)) & 0xF;
-        qm[r + 8] = (q1 >> (4 * r)) & 0xF;
+    for (int r = 0; r < RR; r++) {
+        qm[r] = ((r < 8 ? (q0 >> (4 * r)) : (q1 >> (4 * (r - 8)))) & 0xF);
     }
-    int H[R];
-    int E[R];
+    int H[RR];
+    int E[RR];
 #pragma unroll
-    for (int r = 0; r < R; r++) {
+    for (int r = 0; r < RR; r++) {
         H[r] = 0;
         E[r] = NEG;
     }
@@ -102,7 +101,7 @@ __device__ __forceinline__ void stripe(
         diag_top = hup;
         int last = NEG;
 #pragma unroll
-        for (int r = 0; r < R; r++) {
+        for (int r = 0; r < RR; r++) {
             const int hleft = H[r];
             const int ev = max(hleft + o, E[r] + e);
             E[r] = ev;
@@ -127,7 +126,7 @@ __device__ __forceinline__ void stripe(
     }
     if (!LOCAL) {
 #pragma unroll
-        for (int r = 0; r < R; r++) {
+        for (int r = 0; r < RR; r++) {
             if (!TAIL || r < rows) best = max(best, H[r]);
         }
     }
@@ -181,13 +180,19 @@ extern "C" __global__ void __launch_bounds__(256, 4) align_score_kernel(
                 const int rows = min(R, n - i0);
                 const bool first = i0 == 0;
                 const bool tail = i0 + R >= n;
+#define ARGS sp, lanes, t, m, q0, q1, rows, first, bnd, total, ma, mi, o, e, best
                 if (local) {
-                    if (tail) stripe<true, true>(sp, lanes, t, m, q0, q1, rows, first, bnd, total, ma, mi, o, e, best);
-                    else stripe<true, false>(sp, lanes, t, m, q0, q1, rows, first, bnd, total, ma, mi, o, e, best);
+                    if (!tail) stripe<true, false, 16>(ARGS);
+                    else if (rows <= 4) stripe<true, true, 4>(ARGS);
+                    else if (rows <= 8) stripe<true, true, 8>(ARGS);
+                    else stripe<true, true, 16>(ARGS);
                 } else {
-                    if (tail) stripe<false, true>(sp, lanes, t, m, q0, q1, rows, first, bnd, total, ma, mi, o, e, best);
-                    else stripe<false, false>(sp, lanes, t, m, q0, q1, rows, first, bnd, total, ma, mi, o, e, best);
+                    if (!tail) stripe<false, false, 16>(ARGS);
+                    else if (rows <= 4) stripe<false, true, 4>(ARGS);
+                    else if (rows <= 8) stripe<false, true, 8>(ARGS);
+                    else stripe<false, true, 16>(ARGS);
                 }
+#undef ARGS
             }
             out[(size_t)qi * n_refs + ri] = (short)best;
         }

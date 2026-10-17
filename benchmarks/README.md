@@ -20,7 +20,7 @@ changes, output byte-identical:
   column inner, state = one panel row per lane group (~25 KB at 200 nt × 32
   lanes, any read length). Same recurrence and op count per cell, reading a
   code-major copy of the profile. `Aligner` uses it for reads of
-  `simd::TRANSPOSED_MIN_READ_LEN` = 1,024 nt or more.
+  `simd::TRANSPOSED_MIN_READ_LEN` = 256 nt or more (was 1,024; re-measured with the non-saturating add).
 - **Panel scoring across the pool** for a read of 16 kb or more (the length at
   which `cut_chunks` already gives it a chunk of its own): one rayon task per
   lane group through the new `Aligner::score_group`, the row handed to
@@ -53,6 +53,11 @@ kernel is 0–4% ahead, so the threshold is 1,024 nt: the first length at which
 the transposed kernel is at least as fast on both ISAs in both modes, well
 above any real tRNA read, so the row-major kernel — measured and tuned for
 those — stays the default for them.
+
+With the non-saturating add (`NEG16`, plain `vpaddw`) the row-major kernel is flat to
+200 nt on AVX-512, drops at 250 nt (L1: 128 B of state per read base at 32 lanes)
+and loses to the transposed kernel from ~300 nt; AVX2's transposed kernel is at
+least as fast at every length. The threshold is therefore 256 nt.
 
 **M1's 395 kb read alone**, real panel (164 references, 24,790 bases):
 
