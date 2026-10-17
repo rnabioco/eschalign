@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- **GPU scoring is ~2× faster** on sm_80+ devices (#9): a half2 (`f16x2`)
+  score kernel scores two references per thread on the FP16 pipe for every
+  read whose DP fits fp16 exactly (`cuda::fits_f16`; every tRNA read does),
+  the int kernel taking the rest in the same batch. Output is byte-identical
+  (`gpu_parity` runs on both kernels). On an A30, M1's reads score at
+  5.3–5.7e11 cells/s against 2.6–3.0e11 (`examples/gpu_score_probe.rs`,
+  `benchmarks/README.md`). Library: `cuda::fits_f16`, `cuda::MAX_REF_LEN_H2`,
+  `GpuScorer::{set_half2, half2, half2_scores_len, geometry_h2, registers_h2}`.
+
 ## 0.2.0
 
 ### Added

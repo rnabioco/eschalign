@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! The CUDA score kernel against the scalar oracle, by equality.
+//! The CUDA score kernels against the scalar oracle, by equality: every
+//! check runs twice, once with the half2 kernel taking the reads inside
+//! `fits_f16` (the default) and once with every read on the int kernel.
 //!
 //! Compiled only with `--features gpu`. Without a usable device (no driver,
 //! no NVRTC, no GPU) the test prints why and passes, so a GPU-less host can
@@ -9,7 +11,7 @@
 #![cfg(feature = "gpu")]
 
 use eschalign::alphabet::{encode, reverse_complement_codes};
-use eschalign::cuda::{GpuScorer, MAX_READ_LEN, MAX_REF_LEN};
+use eschalign::cuda::{GpuScorer, MAX_READ_LEN, MAX_REF_LEN, MAX_REF_LEN_H2, fits_f16};
 use eschalign::{Mode, Panel, Scoring, scalar};
 
 /// Build a scorer, or say why there is no GPU here and return `None`.
@@ -84,11 +86,18 @@ fn random_panel(rng: &mut Rng, n_refs: usize, min_len: usize, spread: usize) -> 
     .unwrap()
 }
 
-fn schemes() -> [Scoring; 3] {
+/// The usual schemes, plus two that only the half2 kernel's masking survives:
+/// a *positive* mismatch, under which the columns a thread walks past its
+/// shorter reference's end would otherwise outscore the real cells, and free
+/// gaps, under which a padding column's cells equal real ones from the top
+/// border down.
+fn schemes() -> [Scoring; 5] {
     [
         Scoring::default(),
         Scoring::new(1, -1, -2, -1).unwrap(),
         Scoring::new(3, -2, -5, -2).unwrap(),
+        Scoring::new(3, 1, -5, -2).unwrap(),
+        Scoring::new(2, -1, 0, 0).unwrap(),
     ]
 }
 
@@ -117,8 +126,9 @@ fn reads_for(rng: &mut Rng, panel: &Panel, n: usize) -> Vec<Vec<u8>> {
 }
 
 /// Every query against every reference, GPU against `scalar::score`, in one
-/// batch (reverse complements included, as `--strand both` sends them).
-/// Returns the number of pairs compared, or `None` when there is no device.
+/// batch (reverse complements included, as `--strand both` sends them) —
+/// on both kernels where the device has both. Returns the number of pairs
+/// compared, or `None` when there is no device.
 fn check(
     panel: &Panel,
     reads: &[Vec<u8>],
@@ -129,10 +139,28 @@ fn check(
     let mut gpu = scorer(panel, scoring, mode)?;
     let mut queries: Vec<Vec<u8>> = reads.to_vec();
     queries.extend(reads.iter().map(|q| reverse_complement_codes(q)));
+    let mut pairs = 0;
+    for half2 in [true, false] {
+        gpu.set_half2(half2);
+        pairs += check_kernel(&mut gpu, panel, &queries, scoring, mode, what);
+    }
+    Some(pairs)
+}
+
+/// One batch on the scorer as configured, every row against the oracle.
+fn check_kernel(
+    gpu: &mut GpuScorer,
+    panel: &Panel,
+    queries: &[Vec<u8>],
+    scoring: Scoring,
+    mode: Mode,
+    what: &str,
+) -> usize {
     let refs: Vec<&[u8]> = queries.iter().map(|q| &q[..]).collect();
     let m = gpu.score_batch(&refs).expect("score_batch");
     assert_eq!(m.len(), queries.len());
     assert_eq!(m.n_refs(), panel.len());
+    let kernel = if gpu.half2() { "half2" } else { "int" };
     // The oracle is the slow half (this crate is unoptimised in the test
     // profile), so it runs on every core; each thread checks every k-th query.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -149,7 +177,8 @@ fn check(
                         assert_eq!(
                             got as i32,
                             want,
-                            "{what} {} {scoring}: query {k} ({} nt) vs reference {r} ({} nt)",
+                            "{what} {} {scoring} {kernel} kernel: query {k} ({} nt) vs \
+                             reference {r} ({} nt)",
                             mode.name(),
                             q.len(),
                             panel.get(r).codes.len()
@@ -159,8 +188,7 @@ fn check(
             });
         }
     });
-    let pairs = queries.len() * panel.len();
-    Some(pairs)
+    queries.len() * panel.len()
 }
 
 fn fixture_panel(fasta: &str) -> Panel {
@@ -231,6 +259,95 @@ fn gpu_scores_equal_scalar() {
         }
     }
     eprintln!("[gpu_parity] {total} (query, reference) pairs equal to scalar::score");
+}
+
+/// A batch whose reads straddle `fits_f16` is split between the kernels —
+/// the long ones on the int kernel, the rest on half2 — and every row is the
+/// oracle's. References long enough that a read of ~700 nt leaves fp16 at
+/// `3,-2,-5,-2` (`k·3 + 12 ≤ 2048` is `k ≤ 678`), still inside the half2
+/// kernel's panel bound.
+#[test]
+fn gpu_splits_a_batch_across_both_kernels() {
+    let mut rng = Rng(0x5eed_0103);
+    let panel = random_panel(&mut rng, 21, 900, 100);
+    assert!(panel.max_len() <= MAX_REF_LEN_H2);
+    let scoring = Scoring::new(3, -2, -5, -2).unwrap();
+    let mut reads: Vec<Vec<u8>> = Vec::new();
+    for t in 0..24 {
+        let len = 600 + 10 * t;
+        let r = &panel.get(rng.below(panel.len())).seq;
+        let read = if t % 3 == 2 {
+            random_seq(&mut rng, len, 0.01)
+        } else {
+            let mut read = mutate(&mut rng, &r[..len.min(r.len())]);
+            read.truncate(len);
+            read
+        };
+        reads.push(encode(&read));
+    }
+    for mode in [Mode::Local, Mode::SemiGlobal] {
+        let Some(mut gpu) = scorer(&panel, scoring, mode) else {
+            return;
+        };
+        if !gpu.half2() {
+            eprintln!("[gpu_parity] no half2 kernel on this device; split not tested");
+            return;
+        }
+        let (on_h2, on_int): (Vec<_>, Vec<_>) =
+            reads.iter().partition(|q| gpu.half2_scores_len(q.len()));
+        assert!(
+            !on_h2.is_empty() && !on_int.is_empty(),
+            "both kernels get reads"
+        );
+        assert!(
+            on_h2
+                .iter()
+                .all(|q| fits_f16(q.len(), panel.max_len(), &scoring))
+        );
+        assert!(
+            on_int
+                .iter()
+                .all(|q| !fits_f16(q.len(), panel.max_len(), &scoring))
+        );
+        let n = check_kernel(&mut gpu, &panel, &reads, scoring, mode, "straddling batch");
+        eprintln!(
+            "[gpu_parity] {} split {} half2 / {} int reads: {n} pairs equal ({})",
+            mode.name(),
+            on_h2.len(),
+            on_int.len(),
+            mode.name()
+        );
+    }
+}
+
+/// A panel the int kernel holds but the half2 kernel (two references a
+/// thread, same shared memory) cannot runs on the int kernel alone.
+#[test]
+fn gpu_half2_needs_a_panel_of_half_the_int_kernels_bound() {
+    let mut rng = Rng(0x5eed_0104);
+    let panel = Panel::new([
+        ("long", random_seq(&mut rng, MAX_REF_LEN_H2 + 1, 0.0)),
+        ("short", random_seq(&mut rng, 80, 0.0)),
+    ])
+    .unwrap();
+    let scoring = Scoring::default();
+    let Some(mut gpu) = scorer(&panel, scoring, Mode::Local) else {
+        return;
+    };
+    assert!(gpu.geometry_h2().is_none(), "half2 kernel laid out");
+    assert!(!gpu.half2());
+    let reads = vec![encode(&random_seq(&mut rng, 120, 0.0))];
+    check_kernel(
+        &mut gpu,
+        &panel,
+        &reads,
+        scoring,
+        Mode::Local,
+        "int-only panel",
+    );
+    let fits = Panel::new([("fits", random_seq(&mut rng, MAX_REF_LEN_H2, 0.0))]).unwrap();
+    let gpu = scorer(&fits, scoring, Mode::Local).unwrap();
+    assert!(gpu.geometry_h2().is_some(), "half2 kernel not laid out");
 }
 
 /// What the kernel does not take comes back unscored (for the CPU), and does
