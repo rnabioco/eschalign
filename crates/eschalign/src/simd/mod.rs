@@ -58,12 +58,13 @@
 //!
 //! # i16 is exact, not approximate
 //!
-//! Lanes are `i16` with saturating arithmetic, and `i16::MIN` stands for −∞.
+//! Lanes are `i16` with plain wrapping adds, and [`NEG16`] (−16384) stands for −∞.
 //! Every real value of a cell is bounded by `min(n, L) · max(|match|,
 //! |mismatch|)` in magnitude (a path is at most that many substitutions from
 //! a zero border), plus one gap open and extend for the gap states; when that
-//! bound is below 32 000 no real value can saturate, and saturation of the
-//! −∞ sentinel is exactly what −∞ should do. [`fits_i16`] checks it per read,
+//! bound is below 15 000 no real value can wrap, a −∞ cell is only ever added
+//! to once before a `max` with a real value, so it cannot wrap either and the
+//! real value always wins. [`fits_i16`] checks it per read,
 //! and a read that does not fit — only possible for references well beyond the
 //! intended ≤ ~1 kb — is scored by the scalar path instead.
 //!
@@ -113,7 +114,12 @@ pub const BACKEND_ENV_DEPRECATED: &str = "ESCAPEPOD_ALIGN_BACKEND";
 /// ([`Kernel::Transposed`]) kernel by default; shorter ones with the
 /// row-major one. Chosen from `examples/long_read_probe.rs` on Cascade Lake
 /// (`benchmarks/README.md`).
-pub const TRANSPOSED_MIN_READ_LEN: usize = 1024;
+pub const TRANSPOSED_MIN_READ_LEN: usize = 256;
+
+/// The kernels' -inf: far enough below any real value (|v| < 15000 by
+/// `fits_i16`) that one non-saturating add of a penalty cannot wrap, and a
+/// real value always wins the max that follows.
+pub(crate) const NEG16: i16 = -16384;
 
 /// Loop order of a SIMD score kernel (see the module docs). Both compute the
 /// same scores; they differ only in what stays in cache.
@@ -217,7 +223,7 @@ pub fn fits_i16(n: usize, max_ref_len: usize, scoring: &Scoring) -> bool {
     let k = n.min(max_ref_len) as i64;
     let m = scoring.match_score.abs().max(scoring.mismatch.abs()) as i64;
     let bound = k * m + scoring.gap_open.abs() as i64 + scoring.gap_extend.abs() as i64;
-    bound < 32_000 && max_ref_len < 32_000
+    bound < 15_000 && max_ref_len < 15_000
 }
 
 /// One lane-width group of references.
@@ -249,7 +255,7 @@ impl Group {
     pub(crate) fn tprof(&self) -> &[i16] {
         self.tprof.get_or_init(|| {
             let (len, lanes) = (self.len, self.lens.len());
-            let mut t = vec![i16::MIN; N_CODES * len * lanes];
+            let mut t = vec![NEG16; N_CODES * len * lanes];
             for (lane, &n) in self.lens.iter().enumerate() {
                 for j in 0..n as usize {
                     for c in 0..N_CODES {
@@ -1080,7 +1086,11 @@ mod tests {
     fn row_major_scoring_does_not_build_tprof() {
         let mut rng = Rng(0x5eed_0006);
         let panel = random_panel(&mut rng, 37);
-        let short = encode(&chimeric_read(&mut rng, &panel, 300));
+        let short = encode(&chimeric_read(
+            &mut rng,
+            &panel,
+            TRANSPOSED_MIN_READ_LEN - 56,
+        ));
         let long = encode(&chimeric_read(
             &mut rng,
             &panel,

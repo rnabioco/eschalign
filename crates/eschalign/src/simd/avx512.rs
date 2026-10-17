@@ -53,7 +53,7 @@ unsafe fn kernel<const LOCAL: bool>(
     assert_eq!(g.lens.len(), W);
     assert!(g.prof.len() >= g.len * N_CODES * W);
     let zero = _mm512_setzero_si512();
-    let neg = _mm512_set1_epi16(i16::MIN);
+    let neg = _mm512_set1_epi16(super::NEG16);
     let vo = _mm512_set1_epi16(gaps.open);
     let ve = _mm512_set1_epi16(gaps.extend);
     let hp = hbuf.as_mut_ptr() as *mut __m512i;
@@ -78,13 +78,13 @@ unsafe fn kernel<const LOCAL: bool>(
                 let s = _mm512_loadu_si512(pj.add(c as usize * W) as *const __m512i);
                 let hleft = _mm512_loadu_si512(hp.add(i));
                 let e = _mm512_max_epi16(
-                    _mm512_adds_epi16(hleft, vo),
-                    _mm512_adds_epi16(_mm512_loadu_si512(ep.add(i)), ve),
+                    _mm512_add_epi16(hleft, vo),
+                    _mm512_add_epi16(_mm512_loadu_si512(ep.add(i)), ve),
                 );
                 _mm512_storeu_si512(ep.add(i), e);
-                let mut h = _mm512_max_epi16(_mm512_adds_epi16(hdiag, s), e);
+                let mut h = _mm512_max_epi16(_mm512_add_epi16(hdiag, s), e);
                 hdiag = hleft;
-                f = _mm512_max_epi16(_mm512_adds_epi16(hup, vo), _mm512_adds_epi16(f, ve));
+                f = _mm512_max_epi16(_mm512_add_epi16(hup, vo), _mm512_add_epi16(f, ve));
                 h = _mm512_max_epi16(h, f);
                 if LOCAL {
                     h = _mm512_max_epi16(h, zero);
@@ -151,7 +151,7 @@ unsafe fn pairs_kernel<const LOCAL: bool>(
     assert!(g.qlens.len() == W && g.rlens.len() == W);
     assert!(g.qt.len() >= n * W && g.rt.len() >= m * W);
     let zero = _mm512_setzero_si512();
-    let neg = _mm512_set1_epi16(i16::MIN);
+    let neg = _mm512_set1_epi16(super::NEG16);
     let wild = _mm512_set1_epi16(WILDCARD as i16);
     let vm = _mm512_set1_epi16(sc.match_score);
     let vx = _mm512_set1_epi16(sc.mismatch);
@@ -201,12 +201,12 @@ unsafe fn pairs_kernel<const LOCAL: bool>(
                     _mm512_cmpeq_epi16_mask(qv, rv) | rwild | _mm512_cmpeq_epi16_mask(qv, wild);
                 let s = _mm512_mask_blend_epi16(same, vx, vm);
                 let hleft = _mm512_loadu_si512(hp.add(i));
-                let e_ext = _mm512_adds_epi16(_mm512_loadu_si512(ep.add(i)), ve);
-                let e = _mm512_max_epi16(_mm512_adds_epi16(hleft, vo), e_ext);
+                let e_ext = _mm512_add_epi16(_mm512_loadu_si512(ep.add(i)), ve);
+                let e = _mm512_max_epi16(_mm512_add_epi16(hleft, vo), e_ext);
                 _mm512_storeu_si512(ep.add(i), e);
-                let f_ext = _mm512_adds_epi16(f, ve);
-                f = _mm512_max_epi16(_mm512_adds_epi16(hup, vo), f_ext);
-                let hd = _mm512_adds_epi16(hdiag, s);
+                let f_ext = _mm512_add_epi16(f, ve);
+                f = _mm512_max_epi16(_mm512_add_epi16(hup, vo), f_ext);
+                let hd = _mm512_add_epi16(hdiag, s);
                 hdiag = hleft;
                 let mut h = _mm512_max_epi16(_mm512_max_epi16(hd, e), f);
                 if LOCAL {
@@ -289,7 +289,7 @@ unsafe fn transposed<const LOCAL: bool>(
     let tprof = g.tprof();
     assert!(tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
     let zero = _mm512_setzero_si512();
-    let neg = _mm512_set1_epi16(i16::MIN);
+    let neg = _mm512_set1_epi16(super::NEG16);
     let vo = _mm512_set1_epi16(gaps.open);
     let ve = _mm512_set1_epi16(gaps.extend);
     let hp = hbuf.as_mut_ptr() as *mut __m512i;
@@ -316,12 +316,12 @@ unsafe fn transposed<const LOCAL: bool>(
                 let s = _mm512_loadu_si512(row.add(j * W) as *const __m512i);
                 let hup = _mm512_loadu_si512(hp.add(j));
                 let f = _mm512_max_epi16(
-                    _mm512_adds_epi16(hup, vo),
-                    _mm512_adds_epi16(_mm512_loadu_si512(fp.add(j)), ve),
+                    _mm512_add_epi16(hup, vo),
+                    _mm512_add_epi16(_mm512_loadu_si512(fp.add(j)), ve),
                 );
                 _mm512_storeu_si512(fp.add(j), f);
-                e = _mm512_max_epi16(_mm512_adds_epi16(hleft, vo), _mm512_adds_epi16(e, ve));
-                let mut h = _mm512_max_epi16(_mm512_adds_epi16(hdiag, s), e);
+                e = _mm512_max_epi16(_mm512_add_epi16(hleft, vo), _mm512_add_epi16(e, ve));
+                let mut h = _mm512_max_epi16(_mm512_add_epi16(hdiag, s), e);
                 hdiag = hup;
                 h = _mm512_max_epi16(h, f);
                 if LOCAL {

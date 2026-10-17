@@ -51,7 +51,7 @@ unsafe fn kernel<const LOCAL: bool>(
     assert_eq!(g.lens.len(), W);
     assert!(g.prof.len() >= g.len * N_CODES * W);
     let zero = _mm256_setzero_si256();
-    let neg = _mm256_set1_epi16(i16::MIN);
+    let neg = _mm256_set1_epi16(super::NEG16);
     let vo = _mm256_set1_epi16(gaps.open);
     let ve = _mm256_set1_epi16(gaps.extend);
     let hp = hbuf.as_mut_ptr() as *mut __m256i;
@@ -77,13 +77,13 @@ unsafe fn kernel<const LOCAL: bool>(
                 let s = _mm256_loadu_si256(pj.add(c as usize * W) as *const __m256i);
                 let hleft = _mm256_loadu_si256(hp.add(i));
                 let e = _mm256_max_epi16(
-                    _mm256_adds_epi16(hleft, vo),
-                    _mm256_adds_epi16(_mm256_loadu_si256(ep.add(i)), ve),
+                    _mm256_add_epi16(hleft, vo),
+                    _mm256_add_epi16(_mm256_loadu_si256(ep.add(i)), ve),
                 );
                 _mm256_storeu_si256(ep.add(i), e);
-                let mut h = _mm256_max_epi16(_mm256_adds_epi16(hdiag, s), e);
+                let mut h = _mm256_max_epi16(_mm256_add_epi16(hdiag, s), e);
                 hdiag = hleft;
-                f = _mm256_max_epi16(_mm256_adds_epi16(hup, vo), _mm256_adds_epi16(f, ve));
+                f = _mm256_max_epi16(_mm256_add_epi16(hup, vo), _mm256_add_epi16(f, ve));
                 h = _mm256_max_epi16(h, f);
                 if LOCAL {
                     h = _mm256_max_epi16(h, zero);
@@ -157,7 +157,7 @@ unsafe fn pairs_kernel<const LOCAL: bool>(
     assert!(g.qlens.len() == W && g.rlens.len() == W);
     assert!(g.qt.len() >= n * W && g.rt.len() >= m * W);
     let zero = _mm256_setzero_si256();
-    let neg = _mm256_set1_epi16(i16::MIN);
+    let neg = _mm256_set1_epi16(super::NEG16);
     let wild = _mm256_set1_epi16(WILDCARD as i16);
     let vm = _mm256_set1_epi16(sc.match_score);
     let vx = _mm256_set1_epi16(sc.mismatch);
@@ -209,12 +209,12 @@ unsafe fn pairs_kernel<const LOCAL: bool>(
                 );
                 let s = select(vx, vm, same);
                 let hleft = _mm256_loadu_si256(hp.add(i));
-                let e_ext = _mm256_adds_epi16(_mm256_loadu_si256(ep.add(i)), ve);
-                let e = _mm256_max_epi16(_mm256_adds_epi16(hleft, vo), e_ext);
+                let e_ext = _mm256_add_epi16(_mm256_loadu_si256(ep.add(i)), ve);
+                let e = _mm256_max_epi16(_mm256_add_epi16(hleft, vo), e_ext);
                 _mm256_storeu_si256(ep.add(i), e);
-                let f_ext = _mm256_adds_epi16(f, ve);
-                f = _mm256_max_epi16(_mm256_adds_epi16(hup, vo), f_ext);
-                let hd = _mm256_adds_epi16(hdiag, s);
+                let f_ext = _mm256_add_epi16(f, ve);
+                f = _mm256_max_epi16(_mm256_add_epi16(hup, vo), f_ext);
+                let hd = _mm256_add_epi16(hdiag, s);
                 hdiag = hleft;
                 let mut h = _mm256_max_epi16(_mm256_max_epi16(hd, e), f);
                 if LOCAL {
@@ -301,7 +301,7 @@ unsafe fn transposed<const LOCAL: bool>(
     let tprof = g.tprof();
     assert!(tprof.len() >= N_CODES * l * W && g.ends.len() >= l);
     let zero = _mm256_setzero_si256();
-    let neg = _mm256_set1_epi16(i16::MIN);
+    let neg = _mm256_set1_epi16(super::NEG16);
     let vo = _mm256_set1_epi16(gaps.open);
     let ve = _mm256_set1_epi16(gaps.extend);
     let hp = hbuf.as_mut_ptr() as *mut __m256i;
@@ -326,12 +326,12 @@ unsafe fn transposed<const LOCAL: bool>(
                 let s = _mm256_loadu_si256(row.add(j * W) as *const __m256i);
                 let hup = _mm256_loadu_si256(hp.add(j));
                 let f = _mm256_max_epi16(
-                    _mm256_adds_epi16(hup, vo),
-                    _mm256_adds_epi16(_mm256_loadu_si256(fp.add(j)), ve),
+                    _mm256_add_epi16(hup, vo),
+                    _mm256_add_epi16(_mm256_loadu_si256(fp.add(j)), ve),
                 );
                 _mm256_storeu_si256(fp.add(j), f);
-                e = _mm256_max_epi16(_mm256_adds_epi16(hleft, vo), _mm256_adds_epi16(e, ve));
-                let mut h = _mm256_max_epi16(_mm256_adds_epi16(hdiag, s), e);
+                e = _mm256_max_epi16(_mm256_add_epi16(hleft, vo), _mm256_add_epi16(e, ve));
+                let mut h = _mm256_max_epi16(_mm256_add_epi16(hdiag, s), e);
                 hdiag = hup;
                 h = _mm256_max_epi16(h, f);
                 if LOCAL {
