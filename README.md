@@ -124,6 +124,10 @@ srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 pixi run -e dev-gpu cargo nextest run 
 - `crates/eschalign` — the library: DP, SIMD/CUDA kernels, `MD`/`NM` (std only, optional `gpu`)
 - `crates/eschalign-cli` — the `eschalign` binary: BAM/FASTA/FASTQ I/O and the pipeline
 
+## Documentation
+
+https://rnabioco.github.io/eschalign/ (built from `docs/` with zensical; `pixi run -e docs docs-check` runs the strict build).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

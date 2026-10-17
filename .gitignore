@@ -7,3 +7,4 @@
 *.profraw
 data/
 perf.data*
+site/

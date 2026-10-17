@@ -1,6 +1,9 @@
 [workspace]
 name = "eschalign"
 channels = ["conda-forge", "bioconda"]
+# The conda-pypi mapping service is not needed (the only PyPI dependency is
+# zensical, whose deps are pure PyPI) and is unreachable from some networks.
+conda-pypi-map = { conda-forge = false, bioconda = false }
 # Two platforms for one machine type. `linux-64-cuda` is the same linux-64 with
 # `__cuda` asserted, which is what conda-forge's CUDA builds require in order to
 # solve at all. Only the `gpu` feature targets it (see `[feature.gpu]`); every
@@ -84,6 +87,20 @@ test-doc = "cargo test --doc"
 check = "cargo check"
 clippy = "cargo clippy --workspace --all-targets"
 
+# Documentation feature (zensical site build).
+[feature.docs.dependencies]
+python = ">=3.10"
+
+[feature.docs.pypi-dependencies]
+zensical = "==0.0.51"
+
+[feature.docs.tasks]
+docs-build = "zensical build"
+docs-serve = "zensical serve"
+# Mirrors the CI docs gate. --clean forces a cold cache: zensical's incremental
+# cache makes --strict link validation nondeterministic, so check a fresh one.
+docs-check = "zensical build --clean --strict"
+
 # Every non-GPU environment carries the empty `cpu` feature, which pins it to
 # plain `linux-64`. Without it an environment inherits both workspace platforms
 # and would need `__cuda` on machines that have no GPU.
@@ -94,6 +111,7 @@ clippy = "cargo clippy --workspace --all-targets"
 [environments]
 default = { features = ["cpu"] }
 dev = { features = ["dev", "cpu"], solve-group = "default" }
+docs = { features = ["docs", "cpu"], solve-group = "default" }
 gpu = { features = ["gpu"] }
 # dev + gpu combo for GPU tests/benches that still want mold linking.
 dev-gpu = { features = ["dev", "gpu"] }
