@@ -2645,9 +2645,20 @@ mod gpu {
         match GpuScorer::new(aligner.panel(), *aligner.scoring(), aligner.mode()) {
             Ok(s) => {
                 let (lanes, groups, blocks) = s.geometry();
+                let half2 = match s.geometry_h2() {
+                    Some((lanes, groups, blocks)) => format!(
+                        "half2 kernel ({groups} group{} x {blocks} blocks of {lanes} threads) \
+                         for reads inside fp16, int kernel for the rest",
+                        if groups == 1 { "" } else { "s" },
+                    ),
+                    None => "int kernel only (half2 needs sm_80 and references of at most \
+                             1,536 nt)"
+                        .to_string(),
+                };
                 info!(
                     "GPU: {} — {groups} reference group{} x {blocks} blocks of {lanes} threads, \
-                     kernel ready in {:.1} s; reads over {MAX_READ_LEN} nt are scored on the CPU",
+                     kernels ready in {:.1} s; {half2}; reads over {MAX_READ_LEN} nt are scored \
+                     on the CPU",
                     s.device_name(),
                     if groups == 1 { "" } else { "s" },
                     t0.elapsed().as_secs_f64(),

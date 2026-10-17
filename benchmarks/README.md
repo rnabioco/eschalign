@@ -4,6 +4,98 @@ Carved out of escapepod-rs 0.31.0. The sections below are that repository's `esc
 
 The harness is `benchmarks/benchmark_align.sh`; see its header for the flags.
 
+## `eschalign --device gpu`: half2 score kernel, two references per thread (2026-10-17, #9)
+
+The int kernel below (one reference per thread, `int` arithmetic) is
+ALU-bound at ~15 INT32 ops a cell. Every value in the DP is an integer, fp16
+holds integers up to 2048 exactly, `−∞` is native, and on sm_80
+`HADD2`/`HMNMX2`/`HFMA2` run on the FP16 pipe rather than the INT32 one — so
+`cuda::kernel::KERNEL_H2_SRC` is the same recurrence in `f16x2`, **two
+references per thread** (one in each half of the register), with the
+substitution as AND + `set.ne.f16x2` + `fma`. A read goes to it when
+`cuda::fits_f16` (`min(n, L)·max(|match|, |mismatch|) + 2|open| + |extend|
+≤ 2048`; ~420 for a tRNA panel at the default scoring) bounds its DP, the
+device is sm_80 or later, and the panel's longest reference is at most
+`MAX_REF_LEN_H2` = 1,536 nt (two references per thread in the same shared
+memory); anything else takes the int kernel, in the same batch, and the
+output is byte-identical either way (`gpu_parity` runs every check on both
+kernels; `align_e2e::device_gpu_output_is_byte_identical`).
+
+**The kernel alone** (`examples/gpu_score_probe.rs`, `score_batch` on M1's
+reads against the 164-reference panel, `srun -p gpu -A gpu_rbi -c 16
+--gres=gpu:1`, one A30, batch 50,000, default scoring; `int` = every read on
+the int kernel as it stands after #11's narrow tail stripe, `auto` = reads
+inside `fits_f16` on the half2 kernel — all of them here):
+
+| reads | mode | `int` | `auto` (half2) | speed-up |
+|---|---|---:|---:|---:|
+| M1, 100–200 nt (352,573) | local | 2.58e11 | **5.28e11** | 2.05× |
+| M1, 100–200 nt | semi-global | 2.96e11 | **5.77e11** | 1.95× |
+| M1, all (489,620 on the GPU) | local | 2.58e11 | **5.26e11** | 2.04× |
+| M1, all | semi-global | 2.96e11 | **5.74e11** | 1.94× |
+
+(cells/s = read length × panel bases; two reps each, within 0.3%. In
+seconds, all of M1: 5.32 → 2.61 local, 4.63 → 2.39 semi-global.) Before #11
+the int kernel was 2.45e11 / 2.83e11 at 100–200 nt (2.44 / 2.82e11 on all of
+M1; 5.61 / 4.87 s), so the half2 kernel's margin over the kernel the spike
+was gated against was 2.15× / 2.04×; its tail stripe is still a full 16
+rows, and porting #11's `RR ∈ {16, 8, 4}` dispatch to it is the obvious next
+step. The int kernel itself is untouched by this change: compiling the
+module for `compute_80` instead of NVRTC's default target moved it by
+nothing.
+
+**Registers decided it.** The half2 kernel carries a `uint2` stripe boundary,
+two reference lengths and a column accumulator on top of the int kernel's 48
+stripe registers; at the int kernel's `__launch_bounds__(256, 4)` (64
+registers) it spills and reaches only 3.42e11 / 3.45e11 (1.40× / 1.22×, the
+spike's first numbers). The sweep, 100–200 nt reads:
+
+| bound | registers | blocks of 96 threads an SM | local | semi-global |
+|---|---:|---:|---:|---:|
+| `(256, 4)` | 64 | 10 | 3.42e11 | 3.45e11 |
+| `(288, 3)` | 72 | 8 | 4.45e11 | 4.12e11 |
+| **`(256, 3)`** | **80** | **8** | **5.28e11** | **5.76e11** |
+| `(256, 2)`, none | 96 | 6 | 4.64e11 | 5.60e11 |
+
+**M1 end to end, GPU arm** — `srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1
+--mem=48G` (compgpu02: Xeon Gold 6526Y, one A30), `-t 16`, `-v`, `main` at
+`4003e29` (before #11, whose narrow tail stripe takes ~0.3 s off the int
+kernel's device time above) and this branch as two `--bin` arms of
+`benchmarks/benchmark_align.sh`, interleaved, both `--features gpu` release
+builds, `--device gpu`, avx512 for the tracebacks, `--md5` equal between the
+arms in every row:
+
+| arm | wall (s) | CPU (s) | MaxRSS (MiB) | waiting on the device (s) |
+|---|---:|---:|---:|---:|
+| `main` | 6.4 / 6.5 | 54.9 / 53.2 | 1,440 / 1,479 | 5.0 / 5.1 |
+| **half2** | **4.3 / 4.2** | 52.2 / 50.9 | 2,123 / 2,099 | 2.3 / 2.2 |
+| `main`, `--strand both --secondary --mode semiglobal` | 10.3 | 66.6 | 1,696 | 9.0 |
+| **half2**, same | **5.5** | 62.0 | 1,739 | 4.1 |
+
+(`rep 1 / rep 2`.) The GPU thread's wait on the device halves, as the probe
+says it should, and the wall follows it down to where the CPU side is the
+bound again (the pool is 45% busy in the default arm, 47% in `main`'s —
+what is left is the reader, the writer and the window between them). The
+default arm holds ~0.65 GB more RSS: the device returns batches faster than
+the dispatcher drains them, so more decoded batches sit in the channel
+after the GPU thread at once; the strand-both arm, whose CPU side has more
+to do per batch, does not show it.
+
+Reproduce:
+
+```bash
+samtools view M1.rbc.bam | cut -f10 > M1.seq
+awk 'length($0)>=100 && length($0)<=200' M1.seq > M1_100_200.seq
+srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 -- \
+    pixi run -e dev-gpu cargo run --release --features gpu -p eschalign \
+    --example gpu_score_probe -- panel.fa M1_100_200.seq 50000 local auto   # or: int
+srun -p gpu -A gpu_rbi -c 16 --gres=gpu:1 --mem=48G -- benchmarks/benchmark_align.sh \
+    --reads .../rebasecall/M1/M1.rbc.bam \
+    --reference .../sacCer3-mature-tRNAs-dual-adapt-v2.fa \
+    --backend avx512 --device gpu --reps 2 --threads 16 --md5 \
+    --bin eschalign-main --bin eschalign-half2 -- -v
+```
+
 ## `eschalign`: long reads — reference-major score kernel and panel scoring across the pool (2026-09-26)
 
 A tRNA sample's median read is ~130 nt, but M1 carries 175 reads over
