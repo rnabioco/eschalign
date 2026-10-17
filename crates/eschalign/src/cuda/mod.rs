@@ -35,6 +35,14 @@
 //!   most [`MAX_REF_LEN_H2`] (two references per thread, same shared memory).
 //!   Elsewhere every read takes the int kernel.
 //!
+//! Both walk the read in 16-row stripes held in registers, and both take the
+//! last stripe at the narrowest of 16, 8 or 4 rows that covers what is left
+//! of the read, so a 130 nt read costs 132 rows rather than 144 (the int
+//! kernel since #11, the half2 kernel since #13: 1.09× / 1.11× at 130 nt,
+//! local / semi-global, on an A30). [`GpuScorer::registers`],
+//! [`GpuScorer::registers_h2`] and the `local_bytes` pair report what the
+//! JIT made of each kernel; `examples/gpu_score_probe.rs` prints them.
+//!
 //! # What goes to the GPU, and what does not
 //!
 //! A query is scored here when it is non-empty, at most [`MAX_READ_LEN`]
@@ -462,6 +470,21 @@ impl GpuScorer {
     /// Registers per thread of the half2 kernel, where there is one.
     pub fn registers_h2(&self) -> Option<i32> {
         self.h2.as_ref().and_then(|l| l.func.num_regs().ok())
+    }
+
+    /// Local memory per thread the driver compiled the int kernel to. The
+    /// kernel keeps everything in registers, so a nonzero value is spills
+    /// (or a stripe array the JIT demoted) — what a tighter launch bound
+    /// costs, and what the register count alone does not show.
+    pub fn local_bytes(&self) -> Option<i32> {
+        self.int.func.local_size_bytes().ok()
+    }
+
+    /// Local memory per thread of the half2 kernel, where there is one.
+    pub fn local_bytes_h2(&self) -> Option<i32> {
+        self.h2
+            .as_ref()
+            .and_then(|l| l.func.local_size_bytes().ok())
     }
 
     /// Whether the half2 kernel is in use: available on this device for this

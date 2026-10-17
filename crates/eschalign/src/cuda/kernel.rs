@@ -29,7 +29,10 @@
 //!   That boundary lives in a global scratch buffer interleaved by thread
 //!   (`scratch[col * total_threads + thread]`, so a warp's accesses coalesce):
 //!   one 4-byte load and one store per column per stripe, 0.5 B of traffic per
-//!   cell at `R = 16`.
+//!   cell at `R = 16`. The last stripe is instantiated at the narrowest of
+//!   16, 8 or 4 rows that covers what is left of the read (`stripe<…, RR>`,
+//!   `rows ≤ 4 → 4`, `≤ 8 → 8`), so a 130 nt read pays for 132 rows rather
+//!   than 144 — 1.09× at that length on an A30.
 //!
 //! * **`__launch_bounds__(256, 4)`** caps the kernel at 64 registers, so four
 //!   blocks of up to 256 threads fit an SM. Left to itself the JIT took 88
@@ -247,9 +250,15 @@ pub(crate) const KERNEL_H2_NAME: &str = "align_score_kernel_h2";
 ///   capped at 64, 4.6e11 at 96 (six blocks of 96 threads an SM), 4.5e11 at
 ///   72 (spills again) and **5.3e11 at 80** (eight blocks), local mode;
 ///   semi-global 3.5 / 5.6 / 4.1 / 5.8e11 (`examples/gpu_score_probe.rs`).
-///
-/// `−∞` padding of the *read* (rows past `n` in the last stripe) is handled
-/// as in the int kernel: those rows are computed and masked out of the best.
+/// * **The last stripe is as narrow as the read's remaining rows allow**, as
+///   in the int kernel: `stripe2<…, RR>` with `RR ∈ {16, 8, 4}` (`rows ≤ 4
+///   → 4`, `≤ 8 → 8`), so a 130 nt read computes 132 rows, not 144. On an
+///   A30 that is 1.09× at 130 nt in local mode and 1.11× in semi-global
+///   (5.07 → 5.51e11 and 5.55 → 6.16e11 cells/s), 1.04× / 1.07× over all of
+///   M1, with the kernel still at 80 registers and 72 B of local memory a
+///   thread (56 B before; the int kernel holds 120 B) — `benchmarks/README.md`.
+///   Rows past `n` inside that stripe are computed and masked out of the
+///   best, as the int kernel does.
 pub(crate) const KERNEL_H2_SRC: &str = r#"
 #if __CUDA_ARCH__ >= 800
 #define NEGINF2 0xFC00FC00u
@@ -304,25 +313,23 @@ __device__ __forceinline__ unsigned int mask_ended(unsigned int v, int j, int mA
     return v;
 }
 
-template <bool LOCAL, bool TAIL>
+template <bool LOCAL, bool TAIL, int RR>
 __device__ __forceinline__ void stripe2(
     const unsigned int* __restrict__ sp, int lanes, int t, int m, int mA, int mB, int mmin,
     unsigned int q0, unsigned int q1, int rows, bool first,
     uint2* __restrict__ bnd, size_t bstride,
     unsigned int mi2, unsigned int d2, unsigned int o2, unsigned int e2, unsigned int& best)
 {
-    unsigned int qm[RH];
+    unsigned int qm[RR];
 #pragma unroll
-    for (int r = 0; r < 8; r++) {
-        const unsigned int a = (q0 >> (4 * r)) & 0xFu;
-        const unsigned int b = (q1 >> (4 * r)) & 0xFu;
+    for (int r = 0; r < RR; r++) {
+        const unsigned int a = (r < 8 ? (q0 >> (4 * r)) : (q1 >> (4 * (r - 8)))) & 0xFu;
         qm[r] = (a << 10) | (a << 26);
-        qm[r + 8] = (b << 10) | (b << 26);
     }
-    unsigned int H[RH];
-    unsigned int E[RH];
+    unsigned int H[RR];
+    unsigned int E[RR];
 #pragma unroll
-    for (int r = 0; r < RH; r++) {
+    for (int r = 0; r < RR; r++) {
         H[r] = 0u;
         E[r] = NEGINF2;
     }
@@ -349,7 +356,7 @@ __device__ __forceinline__ void stripe2(
         // in the read's last row.
         unsigned int cb = NEGINF2;
 #pragma unroll
-        for (int r = 0; r < RH; r++) {
+        for (int r = 0; r < RR; r++) {
             const unsigned int hleft = H[r];
             const unsigned int ev = hmax2(hadd2(hleft, o2), hadd2(E[r], e2));
             E[r] = ev;
@@ -375,7 +382,7 @@ __device__ __forceinline__ void stripe2(
             // A reference's last column: its half of the stripe's H column.
             unsigned int cm = NEGINF2;
 #pragma unroll
-            for (int r = 0; r < RH; r++) {
+            for (int r = 0; r < RR; r++) {
                 if (!TAIL || r < rows) cm = hmax2(cm, H[r]);
             }
             if (j + 1 != mA) cm = (cm & 0xFFFF0000u) | 0x0000FC00u;
@@ -436,13 +443,19 @@ extern "C" __global__ void __launch_bounds__(256, 3) align_score_kernel_h2(
                 const int rows = min(RH, n - i0);
                 const bool first = i0 == 0;
                 const bool tail = i0 + RH >= n;
+#define ARGS sp, lanes, t, m, mA, mB, mmin, q0, q1, rows, first, bnd, total, mi2, d2, o2, e2, best
                 if (local) {
-                    if (tail) stripe2<true, true>(sp, lanes, t, m, mA, mB, mmin, q0, q1, rows, first, bnd, total, mi2, d2, o2, e2, best);
-                    else stripe2<true, false>(sp, lanes, t, m, mA, mB, mmin, q0, q1, rows, first, bnd, total, mi2, d2, o2, e2, best);
+                    if (!tail) stripe2<true, false, 16>(ARGS);
+                    else if (rows <= 4) stripe2<true, true, 4>(ARGS);
+                    else if (rows <= 8) stripe2<true, true, 8>(ARGS);
+                    else stripe2<true, true, 16>(ARGS);
                 } else {
-                    if (tail) stripe2<false, true>(sp, lanes, t, m, mA, mB, mmin, q0, q1, rows, first, bnd, total, mi2, d2, o2, e2, best);
-                    else stripe2<false, false>(sp, lanes, t, m, mA, mB, mmin, q0, q1, rows, first, bnd, total, mi2, d2, o2, e2, best);
+                    if (!tail) stripe2<false, false, 16>(ARGS);
+                    else if (rows <= 4) stripe2<false, true, 4>(ARGS);
+                    else if (rows <= 8) stripe2<false, true, 8>(ARGS);
+                    else stripe2<false, true, 16>(ARGS);
                 }
+#undef ARGS
             }
             if (riA >= 0) out[(size_t)qi * n_refs + riA] = (short)half_lo_to_int(best);
             if (riB >= 0) out[(size_t)qi * n_refs + riB] = (short)half_hi_to_int(best);
