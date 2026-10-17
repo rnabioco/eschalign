@@ -2,8 +2,19 @@
 
 ## Unreleased
 
+## 0.3.0
+
 ### Changed
 
+- **CPU score and traceback kernels use plain `vpaddw`** instead of the
+  saturating add (#11), with `-16384` standing for −∞ and `fits_i16` tightened
+  to 15 000 (a no-op for any tRNA panel). On Cascade Lake the saturating zmm add
+  and max both ran on port 0 only; AVX-512 kernel throughput rises 1.13–1.36×
+  there and 1.44–1.60× on Ice Lake, where AVX-512 had been losing to AVX2.
+  Output is byte-identical. `simd::TRANSPOSED_MIN_READ_LEN` drops from 1,024 to
+  256 nt to match the new crossover.
+- The int CUDA kernel's last stripe is the narrowest of 16, 8 or 4 rows that
+  covers the read's remaining rows (#11): 1.09× at 130 nt on an A30.
 - **GPU scoring is ~2× faster** on sm_80+ devices (#9): a half2 (`f16x2`)
   score kernel scores two references per thread on the FP16 pipe for every
   read whose DP fits fp16 exactly (`cuda::fits_f16`; every tRNA read does),

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/rnabioco/eschalign"
@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive"] }
 # GPU acceleration (opt-in via the `gpu` feature; runtime-compiled CUDA kernels
 # via NVRTC). `dynamic-loading` means nothing CUDA is needed to build.
 cudarc = { version = "0.19", default-features = false, features = ["cuda-12020", "driver", "nvrtc", "std", "dynamic-loading"] }
-eschalign = { path = "crates/eschalign", version = "0.2.0" }
+eschalign = { path = "crates/eschalign", version = "0.3.0" }
 indicatif = "0.18"
 rayon = "1"
 tracing = "0.1"
