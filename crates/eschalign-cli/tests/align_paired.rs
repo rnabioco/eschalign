@@ -17,6 +17,7 @@ use sam::alignment::io::Write as _;
 use sam::alignment::record::Flags;
 use sam::alignment::record::data::field::Tag;
 use sam::alignment::record_buf::data::field::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -459,7 +460,7 @@ fn align_single_input(dir: &Path, tag: &str, reads: &Path, extra: &[&str]) -> Ve
 }
 
 #[test]
-fn pair_inputs_agree_fastq_interleaved_ubam() {
+fn fastq_pair_matches_interleaved_and_ubam() {
     let dir = tempfile::tempdir().unwrap();
     let (il, ubam) = other_forms(dir.path());
     for extra in [&[][..], &["--strand", "both", "--secondary"][..]] {
@@ -498,44 +499,32 @@ fn pair_inputs_agree_fastq_interleaved_ubam() {
     assert_eq!(lines(&suffixed), lines(&plain));
 }
 
+fn write_fastq(p: &Path, recs: &[(String, String, String)]) {
+    let t: String = recs
+        .iter()
+        .map(|(n, s, q)| format!("@{n}\n{s}\n+\n{q}\n"))
+        .collect();
+    std::fs::write(p, t).unwrap();
+}
+
+/// Run eschalign expecting failure; its stderr.
+fn fail(args: &[&std::ffi::OsStr]) -> String {
+    let o = eschalign(args);
+    assert!(!o.status.success(), "this run must fail");
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
 #[test]
-fn pair_orphan_is_error() {
+fn mate_name_mismatch_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let r1 = fastq_records(&fx().join("pairs_R1.fq"));
-    let r2 = fastq_records(&fx().join("pairs_R2.fq"));
-    let write = |p: &Path, recs: &[(String, String, String)]| {
-        let t: String = recs
-            .iter()
-            .map(|(n, s, q)| format!("@{n}\n{s}\n+\n{q}\n"))
-            .collect();
-        std::fs::write(p, t).unwrap();
-    };
-    let fail = |args: &[&std::ffi::OsStr]| -> String {
-        let o = eschalign(args);
-        assert!(!o.status.success(), "an orphan mate must fail the run");
-        String::from_utf8_lossy(&o.stderr).into_owned()
-    };
+    let mut r2 = fastq_records(&fx().join("pairs_R2.fq"));
+    let (full, sw) = (dir.path().join("full.fq"), dir.path().join("swapped.fq"));
+    write_fastq(&full, &r1);
+    r2.swap(0, 1);
+    write_fastq(&sw, &r2);
     let out = dir.path().join("o.bam");
-    // Mate file one record short: the read left over is named.
-    let (short, full) = (dir.path().join("short.fq"), dir.path().join("full.fq"));
-    write(&short, &r2[..r2.len() - 1]);
-    write(&full, &r1);
-    let err = fail(&[
-        "-1".as_ref(),
-        full.as_os_str(),
-        "-2".as_ref(),
-        short.as_os_str(),
-        "-r".as_ref(),
-        panel().as_os_str(),
-        "-o".as_ref(),
-        out.as_os_str(),
-    ]);
-    assert!(err.contains("plain") && err.contains("no mate"), "{err}");
-    // Names that do not match at the same record.
-    let mut swapped = r2.clone();
-    swapped.swap(0, 1);
-    let sw = dir.path().join("swapped.fq");
-    write(&sw, &swapped);
+    // The first mismatch is named, with both files.
     let err = fail(&[
         "-1".as_ref(),
         full.as_os_str(),
@@ -547,6 +536,80 @@ fn pair_orphan_is_error() {
         out.as_os_str(),
     ]);
     assert!(err.contains("paralog") && err.contains("pair_tie"), "{err}");
+    assert!(
+        err.contains("full.fq") && err.contains("swapped.fq"),
+        "{err}"
+    );
+    // Interleaved: the neighbour is not the mate.
+    let il = dir.path().join("il.fq");
+    let recs: Vec<_> = r1
+        .iter()
+        .zip(&r2)
+        .flat_map(|(a, b)| [a.clone(), b.clone()])
+        .collect();
+    write_fastq(&il, &recs);
+    let err = fail(&[
+        il.as_os_str(),
+        "--interleaved".as_ref(),
+        "-r".as_ref(),
+        panel().as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+    ]);
+    assert!(err.contains("paralog") && err.contains("no mate"), "{err}");
+}
+
+#[test]
+fn non_adjacent_bam_mates_say_to_collate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, ubam) = other_forms(dir.path());
+    let (header, mut recs) = read_bam(&ubam);
+    // Mate 1s first, then mate 2s: valid pairs, but not adjacent.
+    recs.sort_by_key(|r| r.flags().is_last_segment());
+    let far = dir.path().join("far.bam");
+    let mut w = bam::io::Writer::new(std::fs::File::create(&far).unwrap());
+    w.write_header(&header).unwrap();
+    for r in &recs {
+        w.write_alignment_record(&header, r).unwrap();
+    }
+    w.try_finish().unwrap();
+    let err = fail(&[
+        far.as_os_str(),
+        "-r".as_ref(),
+        panel().as_os_str(),
+        "-o".as_ref(),
+        dir.path().join("o.bam").as_os_str(),
+    ]);
+    assert!(err.contains("samtools collate"), "{err}");
+}
+
+#[test]
+fn unequal_counts_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let r1 = fastq_records(&fx().join("pairs_R1.fq"));
+    let r2 = fastq_records(&fx().join("pairs_R2.fq"));
+    let (short, full) = (dir.path().join("short.fq"), dir.path().join("full.fq"));
+    write_fastq(&short, &r2[..r2.len() - 1]);
+    write_fastq(&full, &r1);
+    let out = dir.path().join("o.bam");
+    let last = &r1.last().unwrap().0;
+    // Either file may be the short one; the read left over is named.
+    for (a, b) in [(&full, &short), (&short, &full)] {
+        let err = fail(&[
+            "-1".as_ref(),
+            a.as_os_str(),
+            "-2".as_ref(),
+            b.as_os_str(),
+            "-r".as_ref(),
+            panel().as_os_str(),
+            "-o".as_ref(),
+            out.as_os_str(),
+        ]);
+        assert!(
+            err.contains(last.as_str()) && err.contains("no mate"),
+            "{err}"
+        );
+    }
     // Interleaved with a trailing orphan.
     let il = dir.path().join("il.fq");
     let mut recs: Vec<_> = r1
@@ -559,7 +622,7 @@ fn pair_orphan_is_error() {
         "ACGTACGTACGTACGTACGT".into(),
         "I".repeat(20),
     ));
-    write(&il, &recs);
+    write_fastq(&il, &recs);
     let err = fail(&[
         il.as_os_str(),
         "--interleaved".as_ref(),
@@ -587,7 +650,10 @@ fn pair_orphan_is_error() {
         "-o".as_ref(),
         out.as_os_str(),
     ]);
-    assert!(err.contains("plain") && err.contains("no mate"), "{err}");
+    assert!(
+        err.contains("discordant") && err.contains("no mate"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -619,7 +685,7 @@ fn pair_ubam_tags_are_copied_on_both_mates() {
 }
 
 #[test]
-fn pair_sort_coordinate_matches_samtools() {
+fn sort_coordinate_matches_samtools_and_fixmate() {
     let dir = tempfile::tempdir().unwrap();
     for extra in [&[][..], &["--secondary", "--strand", "both"][..]] {
         let (_, unsorted) = align_fixture(dir.path(), "u", extra);
@@ -659,7 +725,7 @@ fn pair_sort_coordinate_matches_samtools() {
         // And samtools itself, when there is one.
         let Some(st) = samtools() else {
             eprintln!(
-                "[align_paired] pair_sort_coordinate_matches_samtools: no samtools; model only"
+                "[align_paired] sort_coordinate_matches_samtools_and_fixmate: no samtools; model only"
             );
             continue;
         };
@@ -673,6 +739,46 @@ fn pair_sort_coordinate_matches_samtools() {
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let (_, st_recs) = read_bam(&theirs);
         assert_eq!(lines(&sorted), lines(&st_recs), "samtools order {extra:?}");
+        // fixmate round trip: name-sort our coordinate-sorted output, let
+        // samtools recompute every mate field, and compare. It must have
+        // nothing to change.
+        if extra.contains(&"--secondary") {
+            continue; // fixmate is defined for primary records
+        }
+        let sorted_path = dir.path().join("s.bam");
+        let (byname, fixed) = (dir.path().join("n.bam"), dir.path().join("f.bam"));
+        let st = samtools().unwrap();
+        let o = Command::new(&st)
+            .args(["sort", "-n", "--no-PG", "-o"])
+            .arg(&byname)
+            .arg(&sorted_path)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let o = Command::new(&st)
+            .args(["fixmate", "-m", "--no-PG", "-O", "bam"])
+            .arg(&byname)
+            .arg(&fixed)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let (_, fixed) = read_bam(&fixed);
+        let mate_fields = |r: &RecordBuf| {
+            (
+                name(r),
+                r.flags().is_first_segment(),
+                flag(r) & (0x1 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80),
+                r.mate_reference_sequence_id(),
+                r.mate_alignment_start(),
+                r.template_length(),
+                string_tag(r, b"MC"),
+            )
+        };
+        let mut ours: Vec<_> = sorted.iter().map(mate_fields).collect();
+        let mut theirs: Vec<_> = fixed.iter().map(mate_fields).collect();
+        ours.sort();
+        theirs.sort();
+        assert_eq!(ours, theirs, "samtools fixmate disagrees {extra:?}");
     }
 }
 
@@ -691,7 +797,7 @@ fn samtools() -> Option<PathBuf> {
 /// record building, so the records must be identical.
 #[cfg(feature = "gpu")]
 #[test]
-fn pair_gpu_matches_cpu() {
+fn device_gpu_output_is_byte_identical() {
     let dir = tempfile::tempdir().unwrap();
     for (k, extra) in [
         &[][..],
@@ -728,7 +834,7 @@ fn pair_gpu_matches_cpu() {
                 stderr.contains("--device gpu cannot run"),
                 "GPU run failed for a reason other than a missing device:\n{stderr}"
             );
-            eprintln!("[align_paired] skipping pair_gpu_matches_cpu: {stderr}");
+            eprintln!("[align_paired] skipping device_gpu_output_is_byte_identical: {stderr}");
             return;
         }
         assert!(stderr.contains("on GPU"), "{stderr}");
@@ -802,4 +908,210 @@ fn pair_chunking_keeps_mates_together() {
         assert_eq!(name(&pair[1]), format!("p{k}"));
         assert!(pair[0].flags().is_first_segment() && pair[1].flags().is_last_segment());
     }
+}
+
+/// Mate 1 alone ties between the paralogs and mate 2 alone separates them
+/// (`paralog` in the fixture: mate 1 sits where `P1` and `P2` are identical,
+/// mate 2 covers the one base that differs). Together they are a unique pair.
+#[test]
+fn joint_score_breaks_tie_a_mate_cannot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, recs) = align_fixture(dir.path(), "joint", &[]);
+    let [a, b] = mates(&recs, "paralog");
+    // Alone, each mate as the unpaired aligner sees it (both strands).
+    let alone = |reads: &str, tag: &str| {
+        let out = dir.path().join(format!("{tag}.bam"));
+        run_ok(&[
+            fx().join(reads).as_os_str(),
+            "-r".as_ref(),
+            panel().as_os_str(),
+            "-o".as_ref(),
+            out.as_os_str(),
+            "--min-score".as_ref(),
+            "40".as_ref(),
+            "--mode".as_ref(),
+            "semiglobal".as_ref(),
+            "--strand".as_ref(),
+            "both".as_ref(),
+        ]);
+        let (_, r) = read_bam(&out);
+        r.into_iter().find(|r| name(r) == "paralog").unwrap()
+    };
+    let m1 = alone("pairs_R1.fq", "m1");
+    let m2 = alone("pairs_R2.fq", "m2");
+    assert_eq!(
+        m1.mapping_quality().map(|q| q.get()),
+        Some(0),
+        "mate 1 ties"
+    );
+    assert!(string_tag(&m1, b"XA").is_some());
+    assert_eq!(
+        m2.mapping_quality().map(|q| q.get()),
+        Some(60),
+        "mate 2 decides"
+    );
+    assert_eq!(ref_name(&h, &m2).as_deref(), Some("P1"));
+    // Jointly: both mates on P1, MAPQ 60, no XA, and each carries the other's
+    // MAPQ in MQ and CIGAR in MC.
+    for r in [a, b] {
+        assert_eq!(ref_name(&h, r).as_deref(), Some("P1"));
+        assert_eq!(r.mapping_quality().map(|q| q.get()), Some(60));
+        assert!(string_tag(r, b"XA").is_none());
+        assert_eq!(int_tag(r, b"MQ"), Some(60));
+        assert_eq!(string_tag(r, b"MC").as_deref(), Some("60M"));
+    }
+}
+
+#[test]
+fn discordant_pair_flags_and_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("d.bam");
+    let (r1, r2) = (fx().join("pairs_R1.fq"), fx().join("pairs_R2.fq"));
+    let stderr = run_ok(&[
+        "-1".as_ref(),
+        r1.as_os_str(),
+        "-2".as_ref(),
+        r2.as_os_str(),
+        "-r".as_ref(),
+        panel().as_os_str(),
+        "-o".as_ref(),
+        out.as_os_str(),
+        "--min-score".as_ref(),
+        "40".as_ref(),
+    ]);
+    let (h, recs) = read_bam(&out);
+    let [a, b] = mates(&recs, "discordant");
+    // Each mate at its own best reference, never forced onto one.
+    assert_eq!(ref_name(&h, a).as_deref(), Some("U1"));
+    assert_eq!(ref_name(&h, b).as_deref(), Some("U2"));
+    assert_eq!(a.mate_reference_sequence_id(), b.reference_sequence_id());
+    assert_eq!(b.mate_reference_sequence_id(), a.reference_sequence_id());
+    assert_eq!(a.mate_alignment_start(), b.alignment_start());
+    // Paired, mate 1 forward, mate 2 reverse, not proper, no TLEN.
+    assert_eq!(flag(a), 0x1 | 0x20 | 0x40);
+    assert_eq!(flag(b), 0x1 | 0x10 | 0x80);
+    assert_eq!((a.template_length(), b.template_length()), (0, 0));
+    assert_eq!(string_tag(a, b"MC").as_deref(), Some("60M"));
+    assert_eq!(int_tag(a, b"MQ"), Some(60));
+    // The run summary counts it (and only it: `wrong_orientation` is
+    // non-proper too, but on one reference).
+    assert!(
+        stderr.contains("1 of the non-proper pairs are discordant"),
+        "{stderr}"
+    );
+    let [c, d] = mates(&recs, "wrong_orientation");
+    assert!(!c.flags().is_properly_segmented());
+    assert_eq!(c.reference_sequence_id(), d.reference_sequence_id());
+}
+
+/// `wrong_orientation` is two mates on the same strand: not a pair under the
+/// default `fr`, a proper one under `ff`.
+#[test]
+fn pair_orientation_ff_makes_same_strand_pair_proper() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, fr) = align_fixture(dir.path(), "fr", &[]);
+    let [a, _] = mates(&fr, "wrong_orientation");
+    assert!(!a.flags().is_properly_segmented());
+    let (h, ff) = align_fixture(dir.path(), "ff", &["--pair-orientation", "ff"]);
+    let [a, b] = mates(&ff, "wrong_orientation");
+    assert_eq!(flag(a), 0x1 | 0x2 | 0x40);
+    assert_eq!(flag(b), 0x1 | 0x2 | 0x80);
+    assert_eq!(ref_name(&h, a), ref_name(&h, b));
+    assert_eq!((a.template_length(), b.template_length()), (100, -100));
+}
+
+// ---------------------------------------------------------------------------
+// Single-end input is unchanged
+// ---------------------------------------------------------------------------
+
+/// The single-end path must write the same bytes it wrote before paired-end
+/// support existed. The golden (`fixtures/unpaired_golden.tsv`) was measured
+/// with the binary at the commit before `feat/paired-end`: for each flag
+/// combination, the record count and an FNV-1a 64 digest of the *uncompressed*
+/// BAM record stream (the header is skipped; its `@PG CL` carries the
+/// temporary paths of the run). `ESCHALIGN_BLESS=1` rewrites it; do that only
+/// when a single-end change is intended, and say so in the commit.
+fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+const CONFIGS: &[(&str, &[&str])] = &[
+    ("default", &[]),
+    (
+        "semiglobal_both_secondary",
+        &["--mode", "semiglobal", "--strand", "both", "--secondary"],
+    ),
+    ("sort_coordinate", &["--sort", "coordinate"]),
+    (
+        "min_score_max_ties",
+        &["--min-score", "60", "--max-ties", "1"],
+    ),
+    (
+        "scoring_bwa",
+        &["--scoring", "1,-1,-2,-1", "--strand", "both"],
+    ),
+    ("max_read_len", &["--max-read-len", "60"]),
+];
+
+/// `(records, digest)` of a BAM's record stream, header skipped.
+fn digest(path: &Path) -> (usize, u64) {
+    let mut raw = Vec::new();
+    noodles_bgzf::io::Reader::new(std::fs::File::open(path).unwrap())
+        .read_to_end(&mut raw)
+        .unwrap();
+    let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap()) as usize;
+    assert_eq!(&raw[..4], b"BAM\x01");
+    let mut off = 8 + u32_at(4);
+    let n_ref = u32_at(off);
+    off += 4;
+    for _ in 0..n_ref {
+        off += 4 + u32_at(off) + 4;
+    }
+    let body = &raw[off..];
+    let (mut n, mut p) = (0, 0);
+    while p < body.len() {
+        p += 4 + u32::from_le_bytes(body[p..p + 4].try_into().unwrap()) as usize;
+        n += 1;
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in body {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (n, h)
+}
+
+#[test]
+fn single_end_output_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut got = String::new();
+    for (label, extra) in CONFIGS {
+        let out = dir.path().join(format!("{label}.bam"));
+        let o = Command::new(env!("CARGO_BIN_EXE_eschalign"))
+            .arg(fixtures().join("trna_mappings_padded.bam"))
+            .arg("-r")
+            .arg(fixtures().join("trna_reference.fa"))
+            .arg("-o")
+            .arg(&out)
+            .args(*extra)
+            .output()
+            .expect("eschalign should launch");
+        assert!(
+            o.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let (n, h) = digest(&out);
+        got.push_str(&format!("{label}\t{n}\t{h:016x}\n"));
+    }
+    let golden = fixtures().join("unpaired_golden.tsv");
+    // A test-only switch, not a runtime knob: any value blesses.
+    #[allow(clippy::disallowed_methods)]
+    let bless = std::env::var_os("ESCHALIGN_BLESS").is_some();
+    if bless {
+        std::fs::write(&golden, &got).unwrap();
+        return;
+    }
+    let want = std::fs::read_to_string(&golden).expect("fixtures/unpaired_golden.tsv");
+    assert_eq!(got, want, "the single-end output changed");
 }

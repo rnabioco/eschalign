@@ -53,6 +53,10 @@
   per-mate `NM`/`MD`/`AS`/`XS`/`XA`, MAPQ 60 only for a unique best reference,
   mates adjacent in input order, `--sort coordinate` and `--secondary` supported.
   See [docs/align.md](docs/align.md#paired-end).
+- `--pair-orientation fr|rf|ff` (default `fr`): how the mates must face each
+  other in a proper pair. `MQ` (the mate's MAPQ) is written beside `MC`, and the
+  run summary counts discordant pairs (mates whose best references differ,
+  each reported at its own) (#4).
 - 3' adapter read-through is detected before alignment (TruSeq Read 1/2
   prefixes; `--adapter-r1`, `--adapter-r2`, `--min-adapter-overlap`,
   `--no-adapter-trim`), the adapter is kept as soft clip with an `ad:i` tag, and
@@ -62,7 +66,7 @@
 - Library: `eschalign::adapter`, `Aligner::map_pairs`/`map_pairs_scored`,
   `PairOptions`, `PairMapping`, `PairHit`.
 - Tests: `align_paired.rs` over a synthesized pair fixture in
-  `tests/fixtures/pairs/`; `align_unpaired.rs` pins the unpaired output to a
+  `tests/fixtures/pairs/`; `align_paired::single_end_output_unchanged` pins the unpaired output to a
   golden record-stream digest.
 
 ### Changed
@@ -70,7 +74,7 @@
 - A BAM whose first record is flagged paired (0x1 with 0x40/0x80) is now a
   paired run; it used to be read as unpaired reads with the flags discarded.
   Every other input, and every existing flag, behaves as before (output
-  byte-identical, `unpaired_output_unchanged`).
+  byte-identical, `single_end_output_unchanged`).
 
 ## 0.1.0
 

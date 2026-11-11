@@ -58,6 +58,7 @@ reverse-strand record is refused.
 | `-t, --threads <N>` | Threads for parallel processing |
 | `-1, --r1 <FASTQ>`, `-2, --r2 <FASTQ>` | Paired input: mate 1 and mate 2 files (plain or gzip). Mates are matched by name, `/1` and `/2` stripped — see [Paired-end](#paired-end) |
 | `--interleaved` | `READS` is an interleaved FASTQ/FASTA (mate 1, mate 2, …). A BAM's pairing comes from its flags and needs no option |
+| `--pair-orientation <fr\|rf\|ff>` | Paired only: how the mates face each other (default `fr`: opposite strands facing each other; `rf`: opposite strands facing away; `ff`: same strand, mate 1 upstream) |
 | `--max-insert <N>` | Paired only: longest insert a proper pair may have (default `500`) |
 | `--adapter-r1 <SEQ>`, `--adapter-r2 <SEQ>` | Paired only: 3' adapter of each mate (default TruSeq Read 1 / Read 2) |
 | `--min-adapter-overlap <N>` | Paired only: shortest 3' match counted as adapter (default `5`) |
@@ -313,8 +314,9 @@ Records are in input order with the two mates adjacent, mate 1 then mate 2;
 |-------|--------------|
 | `FLAG` | 0x1; 0x2 only for a proper pair; 0x10 / 0x20 for each mate's / its partner's strand; 0x40 / 0x80; 0x4 / 0x8 for an unmapped mate / partner; QC-fail and duplicate (0x200, 0x400) from the input |
 | `RNEXT` / `PNEXT` | the partner's reference and position (`=` is the same reference); for an unmapped partner, the mate's own |
-| `TLEN` | the true insert — leftmost aligned base to rightmost, over both mates — positive on the leftmost mate (mate 1 if they start together), negative on the other. Set for any pair with both mates on one reference, proper or not |
-| `MC:Z` | the partner's CIGAR (absent when the partner is unmapped) |
+| `TLEN` | as `samtools fixmate` computes it: the partner's 5' end minus this mate's (a forward mate's 5' end is its start, a reverse mate's its end), so for a proper pair the insert, positive on the forward-strand mate and negative on the other. Set for any pair with both mates on one reference, proper or not |
+| `MC:Z` | the partner's CIGAR (`*` when the partner is unmapped) |
+| `MQ:i` | the partner's MAPQ (60 unique, 0 tied), when the partner is mapped |
 | `AS:i` | that mate's own score (the pair score is the two summed) |
 | `XS:i` | that mate's best score over the candidates outside the pair's tie set |
 | `XA:Z` | `ref,±pos,CIGAR,NM;` — see below |

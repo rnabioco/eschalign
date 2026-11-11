@@ -120,8 +120,8 @@ use sam::header::record::value::map::{self, Program, ReferenceSequence, program:
 use std::sync::Arc;
 
 use eschalign::{
-    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, PairMapping, PairOptions, Panel, ReadMapping,
-    ScoreMatrix, Scoring, sam as align_sam,
+    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, PairMapping, PairOptions, PairOrientation,
+    Panel, ReadMapping, ScoreMatrix, Scoring, sam as align_sam,
 };
 use rayon::prelude::*;
 
@@ -159,6 +159,13 @@ pub struct AlignArgs {
     /// reference base of either mate) a proper pair may have [default: 500]
     #[arg(long, value_name = "N")]
     pub max_insert: Option<usize>,
+
+    /// Paired input only: how the mates face each other in a proper pair.
+    /// `fr`: opposite strands, facing each other (mate 2 is scored on the
+    /// strand opposite mate 1); `rf`: opposite strands, facing away; `ff`:
+    /// the same strand, mate 1 upstream [default: fr]
+    #[arg(long, value_enum, value_name = "ORIENTATION")]
+    pub pair_orientation: Option<OrientationArg>,
 
     /// Paired input only: mate 1's 3' adapter (its prefix is enough)
     /// [default: TruSeq Read 1, AGATCGGAAGAGCACACGTCTGAACTCCAGTCA]
@@ -276,6 +283,23 @@ pub struct AlignArgs {
 pub enum StrandArg {
     Forward,
     Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OrientationArg {
+    Fr,
+    Rf,
+    Ff,
+}
+
+impl From<OrientationArg> for PairOrientation {
+    fn from(o: OrientationArg) -> Self {
+        match o {
+            OrientationArg::Fr => PairOrientation::Fr,
+            OrientationArg::Rf => PairOrientation::Rf,
+            OrientationArg::Ff => PairOrientation::Ff,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -767,7 +791,7 @@ impl PairSource {
                 if mate_stem(&name_a) != mate_stem(&name_b) {
                     bail!(
                         "read {} has no mate: the next record is {} (mates must be adjacent, \
-                         name-grouped)",
+                         name-grouped: run `samtools collate` or `samtools sort -n` first)",
                         show(&name_a),
                         show(&name_b)
                     );
@@ -885,6 +909,7 @@ fn read_pair_batches(
 #[derive(Clone)]
 struct PairCfg {
     max_insert: usize,
+    orientation: PairOrientation,
     /// `None` under `--no-adapter-trim`.
     adapters: Option<AdapterSet>,
 }
@@ -959,6 +984,9 @@ fn pair_cfg_from(args: &AlignArgs) -> anyhow::Result<PairCfg> {
     };
     Ok(PairCfg {
         max_insert: args.max_insert.unwrap_or(500),
+        orientation: args
+            .pair_orientation
+            .map_or(PairOrientation::Fr, Into::into),
         adapters,
     })
 }
@@ -1166,6 +1194,8 @@ fn build_records(
 /// adapter length.
 const MC_TAG: Tag = Tag::new(b'M', b'C');
 const AD_TAG: Tag = Tag::new(b'a', b'd');
+/// The mate's mapping quality, set beside `MC` when the mate is placed.
+const MQ_TAG: Tag = Tag::new(b'M', b'Q');
 
 /// How one mate was placed, however its pair resolved.
 struct MatePlacement<'a> {
@@ -1184,15 +1214,22 @@ struct MatePlacement<'a> {
     unique: bool,
 }
 
-/// `TLEN` of `hit` against its partner: the span from the leftmost aligned
-/// base of either to the rightmost, positive for the leftmost mate (mate 1
-/// when both start together) and negative for the other.
-fn template_length(hit: &Hit, partner: &Hit, first: bool) -> i32 {
-    let (a, b) = (&hit.alignment, &partner.alignment);
-    let len = a.ref_end.max(b.ref_end) - a.ref_start.min(b.ref_start);
-    let left = a.ref_start < b.ref_start || (a.ref_start == b.ref_start && first);
-    let len = i32::try_from(len).unwrap_or(i32::MAX);
-    if left { len } else { -len }
+/// A placed mate's MAPQ: 60 when its reference is unique, else 0.
+fn mate_mapq(unique: bool) -> i64 {
+    if unique { 60 } else { 0 }
+}
+
+/// `TLEN` of `hit` against its partner, as `samtools fixmate` computes it: the
+/// partner's 5' end minus this mate's, where a mate's 5' end is the start of a
+/// forward alignment and the (exclusive) end of a reverse one. For a proper
+/// pair that is the insert, positive on the forward-strand mate and negative on
+/// the other; it is what keeps a `fixmate` round trip a no-op.
+fn template_length(hit: &Hit, partner: &Hit) -> i32 {
+    let five = |h: &Hit| {
+        let a = &h.alignment;
+        i64::try_from(if h.reverse { a.ref_end } else { a.ref_start }).unwrap_or(i64::MAX)
+    };
+    i32::try_from(five(partner) - five(hit)).unwrap_or(i32::MAX)
 }
 
 /// Rewrite a read pair's two input records into its output records: the two
@@ -1217,7 +1254,7 @@ fn build_pair_records(
     for m in 0..2 {
         let rec = &mut recs[m];
         kept[m] = rec.flags() & (Flags::QC_FAIL | Flags::DUPLICATE);
-        for t in OWNED_TAGS.iter().chain([&MC_TAG, &AD_TAG]) {
+        for t in OWNED_TAGS.iter().chain([&MC_TAG, &MQ_TAG, &AD_TAG]) {
             rec.data_mut().remove(t);
         }
         *rec.mate_reference_sequence_id_mut() = None;
@@ -1293,14 +1330,18 @@ fn build_pair_records(
                     clipped_span(oh, adn[o]).1,
                 );
                 rec.data_mut().insert(MC_TAG, Value::String(mc.into()));
+                rec.data_mut()
+                    .insert(MQ_TAG, int_value(mate_mapq(mates[o].unique)));
                 if h.reference == oh.reference {
-                    *rec.template_length_mut() = template_length(h, oh, m == 0);
+                    *rec.template_length_mut() = template_length(h, oh);
                 }
             }
             (Some(h), None) => {
                 flags[m] |= Flags::MATE_UNMAPPED;
                 *rec.mate_reference_sequence_id_mut() = Some(h.reference);
                 *rec.mate_alignment_start_mut() = Some(position(h.alignment.ref_start));
+                // The mate has no CIGAR; `samtools fixmate` writes `MC:Z:*`.
+                rec.data_mut().insert(MC_TAG, Value::String("*".into()));
             }
             (None, Some(oh)) => {
                 // An unmapped mate sits at its partner's position, as samtools
@@ -1312,6 +1353,15 @@ fn build_pair_records(
                 *rec.alignment_start_mut() = Some(position(oh.alignment.ref_start));
                 *rec.mate_reference_sequence_id_mut() = Some(oh.reference);
                 *rec.mate_alignment_start_mut() = Some(position(oh.alignment.ref_start));
+                let mc = align_sam::cigar_string(
+                    &oh.alignment.ops,
+                    full[o],
+                    clipped_span(oh, adn[o]).0,
+                    clipped_span(oh, adn[o]).1,
+                );
+                rec.data_mut().insert(MC_TAG, Value::String(mc.into()));
+                rec.data_mut()
+                    .insert(MQ_TAG, int_value(mate_mapq(mates[o].unique)));
             }
             (None, None) => flags[m] |= Flags::MATE_UNMAPPED,
         }
@@ -1359,7 +1409,7 @@ fn build_pair_records(
                         if proper {
                             f |= Flags::PROPERLY_SEGMENTED;
                             if ph.reference == h.reference {
-                                b = b.set_template_length(template_length(h, ph, m == 0));
+                                b = b.set_template_length(template_length(h, ph));
                             }
                         }
                     }
@@ -1407,6 +1457,8 @@ struct Job<'a> {
     /// Read pairs seen, and of those how many resolved as proper pairs.
     pairs: AtomicU64,
     proper_pairs: AtomicU64,
+    /// Pairs whose mates both mapped, but to different references.
+    discordant_pairs: AtomicU64,
 }
 
 /// Whether `--max-read-len` keeps a read of `len` bases out of alignment.
@@ -1605,6 +1657,7 @@ fn process_pair_chunk(
         max_ties: ctx.opts.max_ties,
         max_insert: cfg.max_insert,
         both_strands: ctx.opts.both_strands,
+        orientation: cfg.orientation,
     };
     let mappings = ctx
         .aligner
@@ -1638,6 +1691,11 @@ fn process_pair_chunk(
                 ([place(0), place(1)], true)
             }
             PairMapping::Separate(ms) => {
+                if let (Some(a), Some(b)) = (ms[0].primary(), ms[1].primary())
+                    && a.reference != b.reference
+                {
+                    ctx.discordant_pairs.fetch_add(1, Ordering::Relaxed);
+                }
                 let place = |m: usize| {
                     let me = &ms[m];
                     let others: Vec<&Hit> = me.hits.iter().skip(1).collect();
@@ -1836,6 +1894,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     } else {
         let given = [
             ("--max-insert", args.max_insert.is_some()),
+            ("--pair-orientation", args.pair_orientation.is_some()),
             ("--adapter-r1", args.adapter_r1.is_some()),
             ("--adapter-r2", args.adapter_r2.is_some()),
             ("--min-adapter-overlap", args.min_adapter_overlap.is_some()),
@@ -1860,8 +1919,11 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
     });
     if paired {
         info!(
-            "paired-end: {} mode, max insert {}, adapters {}",
+            "paired-end: {} mode, {:?} orientation, max insert {}, adapters {}",
             mode.name(),
+            pair_cfg
+                .as_ref()
+                .map_or(PairOrientation::Fr, |c| c.orientation),
             pair_cfg.as_ref().map_or(0, |c| c.max_insert),
             match pair_cfg.as_ref().and_then(|c| c.adapters.as_ref()) {
                 Some(a) => format!("searched (min overlap {})", a.min_overlap),
@@ -2039,6 +2101,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         pair: pair_cfg,
         pairs: AtomicU64::new(0),
         proper_pairs: AtomicU64::new(0),
+        discordant_pairs: AtomicU64::new(0),
     };
     let busy = dispatch(&ctx, batches, res_tx, permit_rx);
     // Join every thread before deciding which error to report: a failed stage
@@ -2123,6 +2186,14 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
             100.0 * proper as f64 / pairs.max(1) as f64,
             style::count(pairs - proper),
         );
+        let discordant = ctx.discordant_pairs.load(Ordering::Relaxed);
+        if discordant > 0 {
+            info!(
+                "{} of the non-proper pairs are discordant: their mates map best to different \
+                 references, and each is reported at its own",
+                style::count(discordant)
+            );
+        }
     }
     let wall = started.elapsed().as_secs_f64();
     let mapped = summary.unique + summary.tied;

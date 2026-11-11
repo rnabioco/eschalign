@@ -8,7 +8,9 @@
 //! forward template strand mate 1 is read as sequenced and mate 2 is
 //! reverse-complemented (an `FR` pair, mate 1 upstream); with
 //! [`PairOptions::both_strands`] the reverse template strand is a candidate
-//! too (mate 1 reverse-complemented, mate 2 as sequenced). A candidate's score
+//! too (mate 1 reverse-complemented, mate 2 as sequenced). [`PairOrientation`]
+//! picks the other layouts: `RF` keeps the strands but wants the mates facing
+//! away from each other, `FF` puts both mates on the template strand. A candidate's score
 //! is `score(mate 1) + score(mate 2)`, each against the reference, and it is
 //! eligible only when **both** mates are at or above
 //! [`PairOptions::min_score`] — the sum alone does not let one good mate carry
@@ -40,6 +42,52 @@
 
 use super::*;
 
+/// How the two mates of a proper pair face each other.
+///
+/// Every candidate has a *template strand*: mate 1's strand. The orientation
+/// fixes mate 2's strand relative to it, and the geometry a pair must have on
+/// the reference (`--pair-orientation` on the CLI).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PairOrientation {
+    /// Mates on opposite strands facing each other (Illumina's usual
+    /// "innie"): the forward-strand mate starts before the reverse-strand
+    /// mate ends.
+    #[default]
+    Fr,
+    /// Mates on opposite strands facing away from each other ("outie"): the
+    /// reverse-strand mate starts at or before the forward-strand mate.
+    Rf,
+    /// Mates on the same strand, mate 1 upstream of mate 2 along it.
+    Ff,
+}
+
+impl PairOrientation {
+    /// Whether mate `m` (0 or 1) is read reverse-complemented when mate 1
+    /// follows the template strand `template_reverse`.
+    fn mate_reverse(self, m: usize, template_reverse: bool) -> bool {
+        match self {
+            PairOrientation::Fr | PairOrientation::Rf => template_reverse ^ (m == 1),
+            PairOrientation::Ff => template_reverse,
+        }
+    }
+
+    /// The geometry check on two traced mates (`al[0]`, `al[1]`).
+    fn geometry_ok(self, al: &[Alignment; 2], template_reverse: bool) -> bool {
+        // Mate order along the template strand: mate 1 first on the forward
+        // template strand, mate 2 first on the reverse one.
+        let (first, second) = if template_reverse {
+            (&al[1], &al[0])
+        } else {
+            (&al[0], &al[1])
+        };
+        match self {
+            PairOrientation::Fr => first.ref_start < second.ref_end,
+            PairOrientation::Rf => second.ref_start <= first.ref_start,
+            PairOrientation::Ff => first.ref_start <= second.ref_start,
+        }
+    }
+}
+
 /// Per-pair policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairOptions {
@@ -52,6 +100,8 @@ pub struct PairOptions {
     pub max_insert: usize,
     /// Also consider the reverse template strand (mate 1 reversed).
     pub both_strands: bool,
+    /// How the mates must face each other.
+    pub orientation: PairOrientation,
 }
 
 impl Default for PairOptions {
@@ -61,6 +111,7 @@ impl Default for PairOptions {
             max_ties: None,
             max_insert: 500,
             both_strands: false,
+            orientation: PairOrientation::Fr,
         }
     }
 }
@@ -130,12 +181,6 @@ struct PairState<'a> {
 }
 
 impl PairState<'_> {
-    /// Mate `m`'s orientation in a candidate on template strand `reverse`:
-    /// mate 1 follows the template, mate 2 is its opposite.
-    fn mate_reverse(m: usize, template_reverse: bool) -> bool {
-        template_reverse ^ (m == 1)
-    }
-
     fn open(&self) -> bool {
         self.found.is_empty() && self.next_tier < self.tiers.len()
     }
@@ -194,7 +239,7 @@ impl Aligner {
                 }
                 for &t in strands {
                     for m in 0..2 {
-                        let rv = PairState::mate_reverse(m, t);
+                        let rv = opts.orientation.mate_reverse(m, t);
                         if st.rows[m][usize::from(rv)].is_empty() {
                             let mut row = Vec::new();
                             self.score_or_take(
@@ -205,8 +250,8 @@ impl Aligner {
                             st.rows[m][usize::from(rv)] = row;
                         }
                     }
-                    let r0 = &st.rows[0][usize::from(PairState::mate_reverse(0, t))];
-                    let r1 = &st.rows[1][usize::from(PairState::mate_reverse(1, t))];
+                    let r0 = &st.rows[0][usize::from(opts.orientation.mate_reverse(0, t))];
+                    let r1 = &st.rows[1][usize::from(opts.orientation.mate_reverse(1, t))];
                     for r in 0..n_refs {
                         let (a, b) = (r0[r], r1[r]);
                         if a >= opts.min_score && b >= opts.min_score {
@@ -255,7 +300,7 @@ impl Aligner {
                     for c in &st.cands[a..b] {
                         let reference = &self.panel.get(c.reference).codes[..];
                         for m in 0..2 {
-                            let rv = PairState::mate_reverse(m, c.reverse);
+                            let rv = opts.orientation.mate_reverse(m, c.reverse);
                             jobs.push((&st.codes[m][usize::from(rv)], reference));
                         }
                     }
@@ -309,7 +354,7 @@ impl Aligner {
                         continue;
                     }
                     for (m, sub) in suboptimal.iter_mut().enumerate() {
-                        let s = st.rows[m][usize::from(PairState::mate_reverse(m, t))][r];
+                        let s = st.rows[m][usize::from(opts.orientation.mate_reverse(m, t))][r];
                         *sub = Some(sub.map_or(s, |x: i32| x.max(s)));
                     }
                 }
@@ -328,7 +373,7 @@ impl Aligner {
                     let reference = self.panel.get(c.reference);
                     let [a0, a1] = al;
                     let mut mates = [a0, a1].into_iter().enumerate().map(|(m, alignment)| {
-                        let rv = PairState::mate_reverse(m, c.reverse);
+                        let rv = opts.orientation.mate_reverse(m, c.reverse);
                         let letters: &[u8] = if rv { &rc[m] } else { st.letters[m] };
                         let (md, nm) = sam::md_nm(
                             letters,
@@ -393,14 +438,7 @@ impl Aligner {
         if al[0].is_empty() || al[1].is_empty() {
             return false;
         }
-        // The mate read as sequenced on the template strand is the "forward"
-        // one: mate 1 on the forward template strand, mate 2 on the reverse.
-        let (fwd, rev) = if template_reverse {
-            (&al[1], &al[0])
-        } else {
-            (&al[0], &al[1])
-        };
-        if fwd.ref_start >= rev.ref_end {
+        if !opts.orientation.geometry_ok(al, template_reverse) {
             return false;
         }
         let lo = al[0].ref_start.min(al[1].ref_start);
@@ -537,6 +575,62 @@ mod tests {
             }
             other => panic!("not proper: {other:?}"),
         }
+    }
+
+    #[test]
+    fn orientation_rf_and_ff() {
+        let (al, a, _) = aligner(Mode::SemiGlobal);
+        let rf = PairOptions {
+            min_score: 30,
+            orientation: PairOrientation::Rf,
+            ..PairOptions::default()
+        };
+        let ff = PairOptions {
+            orientation: PairOrientation::Ff,
+            ..rf
+        };
+        // An FR pair (mate 1 forward upstream, mate 2 reverse downstream) is
+        // not an RF pair: it is the same alignments, so only the geometry
+        // decides, and an innie is not an outie.
+        let r1 = a[..30].to_vec();
+        let r2 = alphabet::reverse_complement(&a[30..]);
+        assert!(matches!(
+            al.map_pairs(
+                &[[&r1, &r2]],
+                &PairOptions {
+                    orientation: PairOrientation::Fr,
+                    ..rf
+                }
+            )[0],
+            PairMapping::Proper { .. }
+        ));
+        assert!(matches!(
+            al.map_pairs(&[[&r1, &r2]], &rf)[0],
+            PairMapping::Separate(_)
+        ));
+        // An outie: mate 1 forward downstream, mate 2 reverse upstream.
+        let o1 = a[30..].to_vec();
+        let o2 = alphabet::reverse_complement(&a[..30]);
+        match &al.map_pairs(&[[&o1, &o2]], &rf)[0] {
+            PairMapping::Proper { hits, .. } => {
+                assert!(!hits[0].mates[0].reverse && hits[0].mates[1].reverse);
+            }
+            other => panic!("not proper: {other:?}"),
+        }
+        // Same strand, mate 1 upstream.
+        let f1 = a[..30].to_vec();
+        let f2 = a[30..].to_vec();
+        match &al.map_pairs(&[[&f1, &f2]], &ff)[0] {
+            PairMapping::Proper { hits, .. } => {
+                assert!(!hits[0].mates[0].reverse && !hits[0].mates[1].reverse);
+            }
+            other => panic!("not proper: {other:?}"),
+        }
+        // Mate 2 upstream of mate 1 on the same strand is not FF.
+        assert!(matches!(
+            al.map_pairs(&[[&f2, &f1]], &ff)[0],
+            PairMapping::Separate(_)
+        ));
     }
 
     #[test]
