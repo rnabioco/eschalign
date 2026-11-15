@@ -4,6 +4,9 @@
 
 ### Added
 
+- `--mods mods.toml`: tag each primary record `zk:i` / `zu:i`, the alignment
+  events (mismatch, insertion, deletion) explained by a known modification
+  site, or not. Annotation only; output is otherwise identical.
 - Criterion benchmarks (`crates/eschalign/benches/`): `kernels` (score per
   backend, mode and read length; row-major against reference-major; a 64-read
   `map_reads` chunk) and `gpu` (`score_batch`, int against half2; needs

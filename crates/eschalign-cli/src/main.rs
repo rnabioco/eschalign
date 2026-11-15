@@ -23,6 +23,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod align;
 mod device;
 mod env;
+mod mods;
 mod progress;
 mod style;
 mod threads;

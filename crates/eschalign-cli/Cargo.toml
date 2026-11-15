@@ -36,6 +36,7 @@ noodles-sam = "0.90"
 owo-colors = "4"
 rayon = { workspace = true }
 tempfile = "3"
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

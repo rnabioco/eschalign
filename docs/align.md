@@ -52,6 +52,7 @@ reverse-strand record is refused.
 | `--max-read-len <N>` | A read longer than this (nt) is not aligned at all and is written unmapped (default `1000`; `0` = no limit) — see [Long reads](#long-reads) |
 | `--max-ties <N>` | At most this many tied references besides the primary go into `XA` and `--secondary` (default: all) |
 | `--secondary` | Also write each tied reference as a secondary (0x100) record |
+| `--mods <TOML>` | Known-modification sidecar: tag primaries `zk:i` (explained events) and `zu:i` (unexplained); see [Known modifications](#known-modifications---mods) |
 | `--strand <forward\|both>` | `forward` (default: direct-RNA reads are always sense) or `both` |
 | `--read-ids <FILE>` | Align only the reads named in FILE, one per line (like `samtools view -N`); the rest are not written |
 | `--batch-size <N>` | Reads per batch (default `50000`); memory is proportional to it |
@@ -143,6 +144,38 @@ tags intact. Reads are never dropped (except by `--read-ids`).
 winner gets flag 16 with `SEQ` reverse-complemented and `QUAL` reversed, as
 SAM requires; per-base tags (`mv`, `MM`/`ML`) are copied verbatim, as `bwa -C`
 does. The tie order is reference order, forward before reverse.
+
+### Known modifications (`--mods`)
+
+`--mods mods.toml` tags each primary record with `zk:i` (events explained by a
+known modification) and `zu:i` (unexplained events). Every mismatch, inserted
+base and deleted base inside the alignment is one event, as in `NM`; clipped
+and free-end bases are not. It is annotation only: scoring, `AS`/`XS`/`XA`/
+`MAPQ`/`MD`/`NM` and every other byte are identical to a run without the
+flag, on every backend and device. Without `--mods`, `zk`/`zu` are not touched;
+with it, an input `zk`/`zu` is replaced. Secondary records and unmapped reads
+carry neither tag. Unpaired input only for now.
+
+The sidecar is one `[[site]]` per reference position, normally written by
+clover (`R/modomics.R`); eschalign does not talk to MODOMICS and does not
+compute Sprinzl numbers:
+
+```toml
+[[site]]
+ref = "tRNA-Ala-GGC-1-1"   # must be in the panel
+pos = 38                   # 1-based into the FASTA sequence as given (adapters included)
+mod = "m1A"                # optional free text; also sprinzl, modomics_code, source
+expect = ["mismatch:T", "deletion"]   # required, explicit; no per-mod defaults
+window = [-1, 1]           # optional, reference bases relative to pos; default [-1, 1]
+```
+
+`expect` entries are `mismatch:<bases>` (the read base shown, A/C/G/T/U),
+`deletion`, `insertion` and `qdip`. An event is explained when a site's window
+covers its reference position (an insertion is anchored at the reference base
+before it) and the site expects that effect. `qdip` is recorded for the site
+table but explains nothing: base quality never enters the classification.
+Unknown keys, unknown references, out-of-range or duplicate positions and
+empty `expect` are errors.
 
 ### Sorted output
 
