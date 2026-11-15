@@ -17,6 +17,7 @@
 
 use crate::AlignError;
 use crate::alphabet::{self, encode};
+use crate::mods::ModTable;
 use crate::panel::Panel;
 use crate::sam;
 use crate::scalar::Alignment;
@@ -83,6 +84,15 @@ impl ReadMapping {
     pub fn primary(&self) -> Option<&Hit> {
         self.hits.first()
     }
+}
+
+/// The outcome of [`Aligner::mod_rerank`] for one read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModRank {
+    /// Mod-aware score of the (new) primary: `zm`.
+    pub score: i32,
+    /// Traced hits sharing that mod-aware score, the primary included: `zt`.
+    pub n_tied: usize,
 }
 
 /// Panel scores for a batch of queries, computed ahead of [`Aligner::map_reads_scored`]:
@@ -552,6 +562,59 @@ impl Aligner {
             })
             .collect()
     }
+
+    /// Re-rank the traced tie set of `m` by the mod-aware score (`--mod-tiebreak`).
+    ///
+    /// Each traced hit gets `zm = AS + explained * refund`, where `explained`
+    /// is the number of its alignment events (mismatches, inserted and deleted
+    /// bases) a known site of `table` explains (see [`ModTable::classify`]) and
+    /// `refund = match_score - mismatch` is what a mismatch costs against a
+    /// match: an explained event is rescored as if it were free. The hits are
+    /// stably sorted by `zm`, highest first, so ties on `zm` keep reference
+    /// order and the first hit is the new primary.
+    ///
+    /// Everything canonical is untouched: `best_score`, `n_tied`,
+    /// `suboptimal` and every hit's alignment (so `AS`, `XS` and MAPQ) are
+    /// exactly as [`Aligner::map_reads`] returned them; only the order of
+    /// `m.hits` may change. The scope is the *traced* hits, so with
+    /// [`MapOptions::max_ties`] it ranks only those. Integers throughout, so the
+    /// result is the same on every backend and device. Returns `None` for an
+    /// unmapped read. `read` is the read as given (any strand).
+    pub fn mod_rerank(
+        &self,
+        m: &mut ReadMapping,
+        read: &[u8],
+        table: &ModTable,
+    ) -> Option<ModRank> {
+        if m.hits.is_empty() {
+            return None;
+        }
+        let refund = self.scoring.match_score - self.scoring.mismatch;
+        let rev_letters = if m.hits.iter().any(|h| h.reverse) {
+            alphabet::reverse_complement(read)
+        } else {
+            Vec::new()
+        };
+        let mut ranked: Vec<(i32, Hit)> = std::mem::take(&mut m.hits)
+            .into_iter()
+            .map(|h| {
+                let letters: &[u8] = if h.reverse { &rev_letters } else { read };
+                let c = table.classify(
+                    h.reference,
+                    &h.alignment,
+                    letters,
+                    &self.panel.get(h.reference).seq,
+                );
+                (h.alignment.score + c.explained as i32 * refund, h)
+            })
+            .collect();
+        // Stable: equal `zm` keeps reference order.
+        ranked.sort_by_key(|&(zm, _)| std::cmp::Reverse(zm));
+        let score = ranked[0].0;
+        let n_tied = ranked.iter().filter(|(zm, _)| *zm == score).count();
+        m.hits = ranked.into_iter().map(|(_, h)| h).collect();
+        Some(ModRank { score, n_tied })
+    }
 }
 
 #[cfg(test)]
@@ -565,6 +628,83 @@ mod tests {
             ("c", b"TTTTTTTTTTTTTTTTTTTT".to_vec()),
         ])
         .unwrap()
+    }
+
+    /// Three paralogs tie on score (the read mismatches all of them at the same
+    /// two bases); only `b` and `c` declare sites there, `b` at both. The
+    /// re-rank puts `b` first and `c` second, leaves every canonical field
+    /// alone, and with no sites keeps reference order.
+    #[test]
+    fn mod_score_ranks_tie_set() {
+        use crate::mods::{Expect, ModSite};
+        let mk = |x: u8, y: u8| {
+            let mut v = b"GGATCCTAGCTAACGT".to_vec();
+            v.push(x);
+            v.extend_from_slice(b"GCAAGCTTC");
+            v.push(y);
+            v.extend_from_slice(b"TGCAACGTTGCA");
+            v
+        };
+        // Mismatch positions: 16 and 26.
+        let panel = Panel::new([
+            ("a", mk(b'T', b'G')),
+            ("b", mk(b'G', b'T')),
+            ("c", mk(b'T', b'G')),
+        ])
+        .unwrap();
+        let read = mk(b'C', b'A');
+        let aligner = Aligner::new(panel, Scoring::default(), Mode::Local).unwrap();
+        let site = |reference: usize, pos: usize, base: &str| {
+            let mut e = Expect::default();
+            e.add(base).unwrap();
+            ModSite {
+                reference,
+                pos,
+                expect: e,
+                window: (0, 0),
+            }
+        };
+        let plain = aligner.map_read(&read, &MapOptions::default());
+        assert_eq!(plain.n_tied, 3);
+        let refs = |m: &ReadMapping| m.hits.iter().map(|h| h.reference).collect::<Vec<_>>();
+        assert_eq!(refs(&plain), [0, 1, 2]);
+
+        let table = ModTable::new(
+            3,
+            [
+                site(1, 16, "mismatch:C"),
+                site(1, 26, "mismatch:A"),
+                site(2, 16, "mismatch:C"),
+            ],
+        );
+        let mut m = plain.clone();
+        let rank = aligner.mod_rerank(&mut m, &read, &table).unwrap();
+        assert_eq!(refs(&m), [1, 2, 0]);
+        // Canonical fields are exactly what they were.
+        assert_eq!(
+            (m.best_score, m.n_tied, m.suboptimal),
+            (plain.best_score, plain.n_tied, plain.suboptimal)
+        );
+        let score = plain.best_score.unwrap();
+        // Two explained mismatches, each refunded match - mismatch = 3.
+        assert_eq!(
+            rank,
+            ModRank {
+                score: score + 6,
+                n_tied: 1
+            }
+        );
+
+        // No sites anywhere: nothing moves, the whole tie set stays tied.
+        let mut n = plain.clone();
+        let none = aligner
+            .mod_rerank(&mut n, &read, &ModTable::new(3, []))
+            .unwrap();
+        assert_eq!(n, plain);
+        assert_eq!(none, ModRank { score, n_tied: 3 });
+        // An unmapped read has no rank.
+        let mut u = aligner.map_read(b"", &MapOptions::default());
+        assert!(aligner.mod_rerank(&mut u, b"", &table).is_none());
     }
 
     #[test]

@@ -271,6 +271,123 @@ fn rejects_unknown_reference() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("not in the panel"));
 }
 
+// --- --mod-tiebreak ---------------------------------------------------------
+// Fixture: `gen_mod_fixture.py` (synthetic paralog pairs that tie on every read).
+
+fn run_paralogs(out: &Path, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_eschalign"))
+        .arg(fixtures().join("mod_reads.fq"))
+        .arg("-r")
+        .arg(fixtures().join("mod_panel.fa"))
+        .arg("-o")
+        .arg(out)
+        .args(["--min-score", "20"])
+        .args(extra)
+        .output()
+        .expect("eschalign should launch")
+}
+
+fn paralog_run(extra: &[&str]) -> Vec<RecordBuf> {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("o.bam");
+    let o = run_paralogs(&out, extra);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    read_bam(&out)
+}
+
+fn paralog_sidecar() -> String {
+    fixtures().join("mod_paralogs.toml").display().to_string()
+}
+
+/// Panel order: Thr-CGT-1, Thr-CGT-2, Val-GAC-1, Val-GAC-2. Reads are named
+/// for their true paralog: `Thr-CGT-2.n` (declared sites on Thr-CGT-2, which
+/// default ranking, lowest index, misses) and `Val-GAC-1.n` (declared on the
+/// lowest index already).
+#[test]
+fn tiebreak_picks_annotated_paralog() {
+    let sc = paralog_sidecar();
+    let plain = paralog_run(&["--mods", &sc]);
+    let ranked = paralog_run(&["--mods", &sc, "--mod-tiebreak"]);
+    assert_eq!(plain.len(), 12);
+    assert_eq!(ranked.len(), 12);
+    let (mut default_hits, mut ranked_hits) = (0, 0);
+    for (p, r) in plain.iter().zip(&ranked) {
+        let name = String::from_utf8_lossy(r.name().unwrap().as_ref()).to_string();
+        let truth = if name.starts_with("Thr-CGT-2") { 1 } else { 2 };
+        let (pid, rid) = (
+            p.reference_sequence_id().unwrap(),
+            r.reference_sequence_id().unwrap(),
+        );
+        // Canonical fields are the same either way: a tie, MAPQ 0, same AS.
+        assert_eq!(p.mapping_quality().map(u8::from), Some(0), "{name}");
+        assert_eq!(r.mapping_quality().map(u8::from), Some(0), "{name}");
+        assert_eq!(int(p, b"AS"), int(r, b"AS"), "{name}");
+        assert!(int(p, b"zm").is_none());
+        // Without the flag the lowest-indexed paralog is primary.
+        assert_eq!(pid % 2, 0, "{name}");
+        default_hits += usize::from(pid == truth);
+        ranked_hits += usize::from(rid == truth);
+        // Two explained mismatches, each refunded match - mismatch = 3; the
+        // other paralog has none declared, so the tie is broken.
+        assert_eq!(int(r, b"zm"), Some(int(r, b"AS").unwrap() + 6), "{name}");
+        assert_eq!(int(r, b"zt"), Some(1), "{name}");
+    }
+    assert_eq!(default_hits, 6, "lowest index is right only for Val");
+    assert_eq!(ranked_hits, 12, "the re-rank picks the annotated paralog");
+}
+
+#[test]
+fn tiebreak_off_is_default() {
+    // `--mods` alone changes nothing but zk/zu, and no zm/zt appears unless
+    // `--mod-tiebreak` is given.
+    let sc = paralog_sidecar();
+    let plain = paralog_run(&["--secondary"]);
+    let mods = paralog_run(&["--secondary", "--mods", &sc]);
+    assert_eq!(plain.len(), mods.len());
+    let (zk, zu) = (Tag::new(b'z', b'k'), Tag::new(b'z', b'u'));
+    for (x, y) in plain.iter().zip(&mods) {
+        let mut y = y.clone();
+        y.data_mut().remove(&zk);
+        y.data_mut().remove(&zu);
+        assert_eq!(x, &y);
+        assert!(int(x, b"zm").is_none() && int(&y, b"zm").is_none());
+        assert!(int(x, b"zt").is_none() && int(&y, b"zt").is_none());
+    }
+}
+
+#[test]
+fn tiebreak_requires_mods() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = run_paralogs(&dir.path().join("o.bam"), &["--mod-tiebreak"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--mods"));
+}
+
+#[test]
+fn tiebreak_records_sidecar_hash_in_pg() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a.bam"), dir.path().join("b.bam"));
+    let sc = paralog_sidecar();
+    assert!(run_paralogs(&a, &["--mods", &sc]).status.success());
+    assert!(
+        run_paralogs(&b, &["--mods", &sc, "--mod-tiebreak"])
+            .status
+            .success()
+    );
+    let ds = |p: &Path| {
+        let mut r = bam::io::Reader::new(std::fs::File::open(p).unwrap());
+        let h = r.read_header().unwrap();
+        h.programs().as_ref().get(&b"eschalign"[..]).and_then(|pg| {
+            pg.other_fields()
+                .get(&sam::header::record::value::map::program::tag::DESCRIPTION)
+                .map(|v| v.to_string())
+        })
+    };
+    assert_eq!(ds(&a), None);
+    let d = ds(&b).expect("DS on a --mod-tiebreak run");
+    assert!(d.contains("mods-fnv1a64="), "{d}");
+}
+
 #[cfg(feature = "gpu")]
 #[test]
 fn device_gpu_tags_identical() {

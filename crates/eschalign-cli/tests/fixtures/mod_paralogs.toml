@@ -1,0 +1,28 @@
+[[site]]
+ref = "Thr-CGT-2"
+pos = 31
+mod = "synthetic"
+expect = ["mismatch:C"]
+window = [0, 0]
+
+[[site]]
+ref = "Thr-CGT-2"
+pos = 46
+mod = "synthetic"
+expect = ["mismatch:C"]
+window = [0, 0]
+
+[[site]]
+ref = "Val-GAC-1"
+pos = 31
+mod = "synthetic"
+expect = ["mismatch:C"]
+window = [0, 0]
+
+[[site]]
+ref = "Val-GAC-1"
+pos = 46
+mod = "synthetic"
+expect = ["mismatch:T"]
+window = [0, 0]
+
