@@ -121,10 +121,11 @@ use std::sync::Arc;
 
 use eschalign::{
     Aligner, Backend, CigarOp, Hit, MapOptions, Mode, PairMapping, PairOptions, Panel, ReadMapping,
-    ScoreMatrix, Scoring, sam as align_sam,
+    ScoreMatrix, Scoring, mods::ModTable, sam as align_sam,
 };
 use rayon::prelude::*;
 
+use crate::mods;
 use crate::progress::create_spinner;
 use crate::style;
 
@@ -247,6 +248,13 @@ pub struct AlignArgs {
     #[arg(long)]
     pub secondary: bool,
 
+    /// Known-modification sidecar (TOML, one `[[site]]` per reference
+    /// position): tag each primary record `zk:i` (events explained by a known
+    /// mod) and `zu:i` (unexplained). Annotation only; scoring and every other
+    /// field are unchanged. Unpaired input only
+    #[arg(long, value_name = "TOML")]
+    pub mods: Option<PathBuf>,
+
     /// `forward` (direct RNA reads are sense) or `both` (also score the
     /// reverse complement; a reverse winner gets flag 16 with SEQ/QUAL
     /// reversed, per-base tags copied verbatim)
@@ -334,6 +342,11 @@ const OWNED_TAGS: [Tag; 5] = [
     Tag::new(b'X', b'S'),
     Tag::new(b'X', b'A'),
 ];
+
+/// `--mods`: events explained by a known modification / unexplained. Owned
+/// (any input value replaced) only when `--mods` is on.
+const MODS_EXPLAINED_TAG: Tag = Tag::new(b'z', b'k');
+const MODS_UNEXPLAINED_TAG: Tag = Tag::new(b'z', b'u');
 
 // ---------------------------------------------------------------------------
 // Input
@@ -1065,10 +1078,15 @@ fn build_records(
     m: &ReadMapping,
     panel: &Panel,
     secondary: bool,
+    mods: Option<&ModTable>,
 ) -> (Vec<RecordBuf>, Outcome) {
     let kept_flags = rec.flags() & (Flags::QC_FAIL | Flags::DUPLICATE);
     for t in &OWNED_TAGS {
         rec.data_mut().remove(t);
+    }
+    if mods.is_some() {
+        rec.data_mut().remove(&MODS_EXPLAINED_TAG);
+        rec.data_mut().remove(&MODS_UNEXPLAINED_TAG);
     }
     *rec.mate_reference_sequence_id_mut() = None;
     *rec.mate_alignment_start_mut() = None;
@@ -1111,6 +1129,18 @@ fn build_records(
     if let Some(xs) = m.suboptimal {
         data.insert(Tag::new(b'X', b'S'), int_value(xs as i64));
     }
+    if let Some(table) = mods {
+        let c = table.classify(
+            primary.reference,
+            &primary.alignment,
+            rec.sequence().as_ref(),
+            &panel.get(primary.reference).seq,
+        );
+        let data = rec.data_mut();
+        data.insert(MODS_EXPLAINED_TAG, int_value(c.explained as i64));
+        data.insert(MODS_UNEXPLAINED_TAG, int_value(c.unexplained as i64));
+    }
+    let data = rec.data_mut();
     let others = &m.hits[1..];
     if !others.is_empty() {
         let xa: String = others
@@ -1393,6 +1423,8 @@ struct Job<'a> {
     in_header: &'a sam::Header,
     out_header: &'a sam::Header,
     secondary: bool,
+    /// `--mods` table, when given.
+    mods: Option<ModTable>,
     /// Score a read of [`SPLIT_MIN_BASES`] or more across the pool.
     split_long: bool,
     /// Read strands scored that way, for `-v`.
@@ -1537,7 +1569,13 @@ fn process_chunk(
         .into_iter()
         .zip(&mappings)
         .map(|(rec, mapping)| {
-            let (out, outcome) = build_records(rec, mapping, ctx.aligner.panel(), ctx.secondary);
+            let (out, outcome) = build_records(
+                rec,
+                mapping,
+                ctx.aligner.panel(),
+                ctx.secondary,
+                ctx.mods.as_ref(),
+            );
             let mut w = bam::io::Writer::from(Vec::with_capacity(8 << 10));
             for r in &out {
                 w.write_alignment_record(ctx.out_header, r)?;
@@ -1885,6 +1923,17 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         panel.max_len(),
         style::path(args.reference.display()),
     );
+    if args.mods.is_some() && paired {
+        bail!("--mods supports unpaired input only for now");
+    }
+    let mods = args
+        .mods
+        .as_deref()
+        .map(|p| mods::load(p, &panel))
+        .transpose()?;
+    if let Some(t) = &mods {
+        info!("mods: {} known sites", style::count(t.n_sites()));
+    }
     if panel.len() > 10_000 || panel.max_len() > 1_000 {
         warn!(
             "`eschalign` scores every read against every reference with no seeding; \
@@ -2032,6 +2081,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         in_header: &in_header,
         out_header: &out_header,
         secondary: args.secondary,
+        mods,
         split_long: !row_major_only,
         split_strands: AtomicU64::new(0),
         max_read_len: args.max_read_len,

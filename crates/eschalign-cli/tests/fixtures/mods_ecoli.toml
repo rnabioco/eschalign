@@ -1,0 +1,38 @@
+# Hand-checked sidecar for the fixture panel (adapter-padded; pos is 1-based
+# into the FASTA sequence as given). The fixture reads are all
+# tRNA-Ala-GGC-1-1, so every site is on that reference.
+#
+# Read `4S127M` at ref 13 (MD 2G1A6G101A0G0T0A1T0A0G6) shows read C at 15,
+# T at 17 and T at 24: site 15 explains the first, site 18 (window 17..19)
+# the second, and site 24 expects A/G, so the T there stays unexplained.
+
+[[site]]
+ref = "tRNA-Ala-GGC-1-1"
+pos = 15
+mod = "test-C"
+expect = ["mismatch:C"]
+source = "fixture"
+
+[[site]]
+ref = "tRNA-Ala-GGC-1-1"
+pos = 18
+mod = "test-T"
+expect = ["mismatch:T", "qdip"]
+source = "fixture"
+
+[[site]]
+ref = "tRNA-Ala-GGC-1-1"
+pos = 24
+mod = "test-AG"
+expect = ["mismatch:AG"]
+window = [0, 0]
+source = "fixture"
+
+[[site]]
+ref = "tRNA-Ala-GGC-1-1"
+pos = 40
+mod = "test-del"
+sprinzl = "26"
+expect = ["deletion", "insertion"]
+window = [-2, 2]
+source = "fixture"

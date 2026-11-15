@@ -55,6 +55,7 @@ pub mod cuda;
 mod error;
 pub mod fasta;
 mod mapper;
+pub mod mods;
 mod panel;
 pub mod sam;
 pub mod scalar;
