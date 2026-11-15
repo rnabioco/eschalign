@@ -52,7 +52,7 @@ reverse-strand record is refused.
 | `--max-read-len <N>` | A read longer than this (nt) is not aligned at all and is written unmapped (default `1000`; `0` = no limit) — see [Long reads](#long-reads) |
 | `--max-ties <N>` | At most this many tied references besides the primary go into `XA` and `--secondary` (default: all) |
 | `--secondary` | Also write each tied reference as a secondary (0x100) record |
-| `--mods <TOML>` | Known-modification sidecar: tag primaries `zk:i` (explained events) and `zu:i` (unexplained); see [Known modifications](#known-modifications---mods) |
+| `--mods <TOML>` | Known-modification sidecar: tag primaries `zk:i` (explained events) and `zu:i` (unexplained); see [Known modifications](#known-modifications) |
 | `--strand <forward\|both>` | `forward` (default: direct-RNA reads are always sense) or `both` |
 | `--read-ids <FILE>` | Align only the reads named in FILE, one per line (like `samtools view -N`); the rest are not written |
 | `--batch-size <N>` | Reads per batch (default `50000`); memory is proportional to it |
@@ -145,7 +145,7 @@ winner gets flag 16 with `SEQ` reverse-complemented and `QUAL` reversed, as
 SAM requires; per-base tags (`mv`, `MM`/`ML`) are copied verbatim, as `bwa -C`
 does. The tie order is reference order, forward before reverse.
 
-### Known modifications (`--mods`)
+### Known modifications
 
 `--mods mods.toml` tags each primary record with `zk:i` (events explained by a
 known modification) and `zu:i` (unexplained events). Every mismatch, inserted
