@@ -52,6 +52,7 @@ reverse-strand record is refused.
 | `--max-read-len <N>` | A read longer than this (nt) is not aligned at all and is written unmapped (default `1000`; `0` = no limit) — see [Long reads](#long-reads) |
 | `--max-ties <N>` | At most this many tied references besides the primary go into `XA` and `--secondary` (default: all) |
 | `--secondary` | Also write each tied reference as a secondary (0x100) record |
+| `--mod-tiebreak` | With `--mods`: re-rank the traced tie set by a mod-aware integer score; tags `zm:i`, `zt:i`; see [Mod-aware tie-break](#mod-aware-tie-break) |
 | `--mods <TOML>` | Known-modification sidecar: tag primaries `zk:i` (explained events) and `zu:i` (unexplained); see [Known modifications](#known-modifications) |
 | `--strand <forward\|both>` | `forward` (default: direct-RNA reads are always sense) or `both` |
 | `--read-ids <FILE>` | Align only the reads named in FILE, one per line (like `samtools view -N`); the rest are not written |
@@ -176,6 +177,38 @@ before it) and the site expects that effect. `qdip` is recorded for the site
 table but explains nothing: base quality never enters the classification.
 Unknown keys, unknown references, out-of-range or duplicate positions and
 empty `expect` are errors.
+
+### Mod-aware tie-break
+
+Paralogs (Thr-CGT-1/2, Val-GAC-1/2) often tie exactly, and the default primary
+is then just the lowest-indexed reference. `--mod-tiebreak` (requires `--mods`)
+orders the tie set by a second, mod-aware score instead. The rule is integer
+and deliberately small:
+
+    zm = AS + explained * (match - mismatch)
+
+`explained` is the number of the hit's alignment events (mismatches, inserted
+bases, deleted bases; the `zk` count) that a known site of that hit's reference
+explains. An explained event is thus rescored as if it were a match (3 points
+each under the default `2,-1,-10,-1`), so a hit whose mismatches fall on
+declared sites ranks above one whose do not. One flat refund per event keeps it
+a pure function of `AS` and a count: no floats, no per-modification weights, and
+the same bytes on every backend and device. The re-rank runs on the CPU after
+traceback, so `--device gpu` is unaffected.
+
+The hits are stably sorted by `zm`, highest first, so ties under `zm` keep
+reference order. `zm:i` is the new primary's mod-aware score and `zt:i` the
+number of traced hits sharing it (`zt` 1 means the tie was broken). The
+primary, the order of `XA` entries and of `--secondary` records may change.
+`AS`, `XS`, the tie set, `XA` membership and MAPQ do not: selection stays exact
+integer equality on the canonical score, and MAPQ stays 0 for any canonical tie
+even when `zt` is 1. A read whose true reference lost on the canonical score is
+not rescued: only hits already traced are ranked (so `--max-ties` limits the
+candidates). `zm`/`zt` are on primary records of mapped reads only, and an input
+`zm`/`zt` is replaced. Off by default; without the flag the output is
+byte-identical to a run without it. With it, the `@PG` line gains
+`DS:mod-tiebreak mods-fnv1a64=<hash of the sidecar>`. Paired input is refused,
+as it is for `--mods`.
 
 ### Sorted output
 

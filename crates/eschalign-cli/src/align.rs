@@ -120,8 +120,8 @@ use sam::header::record::value::map::{self, Program, ReferenceSequence, program:
 use std::sync::Arc;
 
 use eschalign::{
-    Aligner, Backend, CigarOp, Hit, MapOptions, Mode, PairMapping, PairOptions, Panel, ReadMapping,
-    ScoreMatrix, Scoring, mods::ModTable, sam as align_sam,
+    Aligner, Backend, CigarOp, Hit, MapOptions, ModRank, Mode, PairMapping, PairOptions, Panel,
+    ReadMapping, ScoreMatrix, Scoring, mods::ModTable, sam as align_sam,
 };
 use rayon::prelude::*;
 
@@ -256,6 +256,14 @@ pub struct AlignArgs {
     #[arg(long, value_name = "TOML")]
     pub mods: Option<PathBuf>,
 
+    /// Re-rank each read's traced tie set by a mod-aware integer score (needs
+    /// `--mods`): `zm:i` = `AS` + (match - mismatch) per alignment event a
+    /// known site explains, `zt:i` = hits tied under `zm`. Ties are stably
+    /// ordered by `zm`, so the primary and `XA` order can change; `AS`, `XS`,
+    /// the tie set and MAPQ (0 for any canonical tie) do not
+    #[arg(long, requires = "mods")]
+    pub mod_tiebreak: bool,
+
     /// `forward` (direct RNA reads are sense) or `both` (also score the
     /// reverse complement; a reverse winner gets flag 16 with SEQ/QUAL
     /// reversed, per-base tags copied verbatim)
@@ -355,6 +363,9 @@ const OWNED_TAGS: [Tag; 5] = [
 /// (any input value replaced) only when `--mods` is on.
 const MODS_EXPLAINED_TAG: Tag = Tag::new(b'z', b'k');
 const MODS_UNEXPLAINED_TAG: Tag = Tag::new(b'z', b'u');
+/// `--mod-tiebreak`: the mod-aware score and the hits tied under it.
+const MOD_SCORE_TAG: Tag = Tag::new(b'z', b'm');
+const MOD_TIED_TAG: Tag = Tag::new(b'z', b't');
 
 // ---------------------------------------------------------------------------
 // Input
@@ -1087,6 +1098,8 @@ fn build_records(
     panel: &Panel,
     secondary: bool,
     mods: Option<&ModTable>,
+    tiebreak: bool,
+    rank: Option<ModRank>,
 ) -> (Vec<RecordBuf>, Outcome) {
     let kept_flags = rec.flags() & (Flags::QC_FAIL | Flags::DUPLICATE);
     for t in &OWNED_TAGS {
@@ -1095,6 +1108,10 @@ fn build_records(
     if mods.is_some() {
         rec.data_mut().remove(&MODS_EXPLAINED_TAG);
         rec.data_mut().remove(&MODS_UNEXPLAINED_TAG);
+    }
+    if tiebreak {
+        rec.data_mut().remove(&MOD_SCORE_TAG);
+        rec.data_mut().remove(&MOD_TIED_TAG);
     }
     *rec.mate_reference_sequence_id_mut() = None;
     *rec.mate_alignment_start_mut() = None;
@@ -1147,6 +1164,11 @@ fn build_records(
         let data = rec.data_mut();
         data.insert(MODS_EXPLAINED_TAG, int_value(c.explained as i64));
         data.insert(MODS_UNEXPLAINED_TAG, int_value(c.unexplained as i64));
+    }
+    if let Some(r) = rank {
+        let data = rec.data_mut();
+        data.insert(MOD_SCORE_TAG, int_value(r.score as i64));
+        data.insert(MOD_TIED_TAG, int_value(r.n_tied as i64));
     }
     let data = rec.data_mut();
     let others = &m.hits[1..];
@@ -1433,6 +1455,8 @@ struct Job<'a> {
     secondary: bool,
     /// `--mods` table, when given.
     mods: Option<ModTable>,
+    /// `--mod-tiebreak`: re-rank the traced tie set by the mod-aware score.
+    mod_tiebreak: bool,
     /// Score a read of [`SPLIT_MIN_BASES`] or more across the pool.
     split_long: bool,
     /// Read strands scored that way, for `-v`.
@@ -1572,20 +1596,30 @@ fn process_chunk(
             hits: Vec::new(),
         })
         .collect();
+    let mut ranks: Vec<Option<ModRank>> = vec![None; records.len()];
     for (&k, m) in kept.iter().zip(aligned) {
         mappings[k] = m;
+    }
+    if let (true, Some(table)) = (ctx.mod_tiebreak, ctx.mods.as_ref()) {
+        // After traceback, on the CPU: the same code for every device.
+        for (&k, seq) in kept.iter().zip(&seqs) {
+            ranks[k] = ctx.aligner.mod_rerank(&mut mappings[k], seq, table);
+        }
     }
     let mut sites = ctx.sites.is_some().then(SiteCounts::default);
     let encoded = records
         .into_iter()
         .zip(&mappings)
-        .map(|(rec, mapping)| {
+        .zip(&ranks)
+        .map(|((rec, mapping), &rank)| {
             let (out, outcome) = build_records(
                 rec,
                 mapping,
                 ctx.aligner.panel(),
                 ctx.secondary,
                 ctx.mods.as_ref(),
+                ctx.mod_tiebreak,
+                rank,
             );
             if let Some(s) = &mut sites {
                 s.add(&out[0], ctx.aligner.panel());
@@ -1777,10 +1811,18 @@ fn score_across_pool(aligner: &Aligner, codes: &[u8]) -> Option<Vec<i16>> {
 // Header
 // ---------------------------------------------------------------------------
 
+/// FNV-1a, 64 bit: a dependency-free content fingerprint.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 fn build_header(
     panel: &Panel,
     input: &sam::Header,
     sort: SortOrder,
+    description: Option<String>,
 ) -> anyhow::Result<sam::Header> {
     let mut hd = Map::<map::Header>::new(Version::new(1, 6));
     let so = match sort {
@@ -1798,11 +1840,14 @@ fn build_header(
     *header.programs_mut() = input.programs().clone();
     *header.comments_mut() = input.comments().to_vec();
     let cl: Vec<String> = std::env::args().collect();
-    let pg = Map::<Program>::builder()
+    let mut pg = Map::<Program>::builder()
         .insert(pg_tag::NAME, "eschalign")
         .insert(pg_tag::VERSION, env!("CARGO_PKG_VERSION"))
-        .insert(pg_tag::COMMAND_LINE, cl.join(" "))
-        .build()?;
+        .insert(pg_tag::COMMAND_LINE, cl.join(" "));
+    if let Some(d) = description {
+        pg = pg.insert(pg_tag::DESCRIPTION, d);
+    }
+    let pg = pg.build()?;
     header.programs_mut().add("eschalign", pg)?;
     Ok(header)
 }
@@ -1953,7 +1998,10 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         style::path(args.reference.display()),
     );
     if args.mods.is_some() && paired {
-        bail!("--mods supports unpaired input only for now");
+        bail!(
+            "--mods (and so --mod-tiebreak) supports unpaired input only for now; \
+             paired input is refused rather than re-ranked"
+        );
     }
     let mods = args
         .mods
@@ -2013,7 +2061,21 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         None
     };
 
-    let out_header = build_header(aligner.panel(), &in_header, args.sort)?;
+    // `--mod-tiebreak` makes the sidecar part of the result, so its content
+    // hash (FNV-1a 64, not cryptographic) goes into @PG `DS`. Absent otherwise,
+    // so a run without the flag writes the header it always did.
+    let description = match (&args.mods, args.mod_tiebreak) {
+        (Some(p), true) => {
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("reading mods sidecar {}", p.display()))?;
+            Some(format!(
+                "mod-tiebreak mods-fnv1a64={:016x}",
+                fnv1a64(&bytes)
+            ))
+        }
+        _ => None,
+    };
+    let out_header = build_header(aligner.panel(), &in_header, args.sort, description)?;
 
     // --- Output ------------------------------------------------------------
     let to_stdout = args.output.as_os_str() == "-";
@@ -2122,6 +2184,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         out_header: &out_header,
         secondary: args.secondary,
         mods,
+        mod_tiebreak: args.mod_tiebreak,
         split_long: !row_major_only,
         split_strands: AtomicU64::new(0),
         max_read_len: args.max_read_len,

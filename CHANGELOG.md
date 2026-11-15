@@ -4,6 +4,11 @@
 
 ### Added
 
+- `--mod-tiebreak` (needs `--mods`): re-rank each read's traced tie set by an
+  integer mod-aware score `zm = AS + explained * (match - mismatch)`, tagging
+  `zm:i` / `zt:i`. The primary and `XA` order may change; `AS`, `XS`, the tie
+  set and MAPQ (0 for any tie) do not. Off by default and byte-identical when
+  off; `@PG DS` carries the sidecar hash when on. Unpaired input only.
 - `--mods mods.toml`: tag each primary record `zk:i` / `zu:i`, the alignment
   events (mismatch, insertion, deletion) explained by a known modification
   site, or not. Annotation only; output is otherwise identical.

@@ -64,7 +64,7 @@ pub mod simd;
 
 pub use error::AlignError;
 pub use mapper::{
-    Aligner, Hit, MapOptions, PairHit, PairMapping, PairOptions, ReadMapping, ScoreMatrix,
+    Aligner, Hit, MapOptions, ModRank, PairHit, PairMapping, PairOptions, ReadMapping, ScoreMatrix,
 };
 pub use panel::{Panel, Reference};
 pub use scalar::{Alignment, CigarOp};
