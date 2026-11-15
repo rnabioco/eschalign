@@ -127,6 +127,7 @@ use rayon::prelude::*;
 
 use crate::mods;
 use crate::progress::create_spinner;
+use crate::sites::{SiteCounts, SiteTable};
 use crate::style;
 
 #[derive(Args)]
@@ -265,6 +266,13 @@ pub struct AlignArgs {
     /// `samtools view -N`; the rest are not written
     #[arg(long, value_name = "FILE")]
     pub read_ids: Option<PathBuf>,
+
+    /// Write a per-(reference, position) pileup of the primary alignments to
+    /// FILE as gzip-compressed TSV: depth, matches, mismatches by base,
+    /// deletions, insertions, MAPQ-60 vs tied depth, and a base-quality
+    /// histogram (a covariate, never a score). The BAM is unchanged
+    #[arg(long, value_name = "FILE.tsv.gz")]
+    pub site_table: Option<PathBuf>,
 
     /// Reads per batch; memory is proportional to it
     #[arg(long, default_value_t = 50_000, value_name = "N")]
@@ -1439,6 +1447,8 @@ struct Job<'a> {
     /// Read pairs seen, and of those how many resolved as proper pairs.
     pairs: AtomicU64,
     proper_pairs: AtomicU64,
+    /// `--site-table`: the pileup every chunk merges its counts into.
+    sites: Option<SiteTable>,
 }
 
 /// Whether `--max-read-len` keeps a read of `len` bases out of alignment.
@@ -1565,7 +1575,8 @@ fn process_chunk(
     for (&k, m) in kept.iter().zip(aligned) {
         mappings[k] = m;
     }
-    records
+    let mut sites = ctx.sites.is_some().then(SiteCounts::default);
+    let encoded = records
         .into_iter()
         .zip(&mappings)
         .map(|(rec, mapping)| {
@@ -1576,13 +1587,25 @@ fn process_chunk(
                 ctx.secondary,
                 ctx.mods.as_ref(),
             );
+            if let Some(s) = &mut sites {
+                s.add(&out[0], ctx.aligner.panel());
+            }
             let mut w = bam::io::Writer::from(Vec::with_capacity(8 << 10));
             for r in &out {
                 w.write_alignment_record(ctx.out_header, r)?;
             }
             Ok((w.into_inner(), outcome))
         })
-        .collect()
+        .collect();
+    merge_sites(ctx, sites);
+    encoded
+}
+
+/// Fold a chunk's site counts into the shared table.
+fn merge_sites(ctx: &Job<'_>, local: Option<SiteCounts>) {
+    if let (Some(t), Some(l)) = (&ctx.sites, local) {
+        t.merge(l);
+    }
 }
 
 /// A chunk of read pairs (mate 1, mate 2 adjacent), start to finish on a
@@ -1654,6 +1677,7 @@ fn process_pair_chunk(
     drop(trimmed);
     ctx.pairs.fetch_add(n as u64, Ordering::Relaxed);
     let mut out: Encoded = Vec::with_capacity(records.len());
+    let mut sites = ctx.sites.is_some().then(SiteCounts::default);
     let mut recs = records.into_iter();
     for (mapping, ad) in mappings.iter().zip(&ads) {
         let pair = [recs.next().expect("mate 1"), recs.next().expect("mate 2")];
@@ -1707,11 +1731,16 @@ fn process_pair_chunk(
             Ok(w.into_inner())
         };
         let [r1, r2] = &prim;
+        if let Some(s) = &mut sites {
+            s.add(r1, ctx.aligner.panel());
+            s.add(r2, ctx.aligner.panel());
+        }
         out.push((encode(&[r1])?, outcomes[0]));
         let mut tail: Vec<&RecordBuf> = vec![r2];
         tail.extend(secs.iter());
         out.push((encode(&tail)?, outcomes[1]));
     }
+    merge_sites(ctx, sites);
     Ok(out)
 }
 
@@ -2014,6 +2043,17 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
             )?)
         }
     };
+    // Opened now so an unwritable path is the first error, not the last.
+    let site_file = args
+        .site_table
+        .as_deref()
+        .map(|p| {
+            if p.extension().is_some_and(|e| e == "parquet") {
+                bail!("--site-table: Parquet output is not supported; use a .tsv.gz path");
+            }
+            File::create(p).with_context(|| format!("creating {}", p.display()))
+        })
+        .transpose()?;
     let sink: Box<dyn Write + Send> = if to_stdout {
         Box::new(std::io::stdout())
     } else {
@@ -2075,7 +2115,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
             write_in_order(writer, sorter, res_rx, permit_tx, &writer_spinner, started)
         })?;
 
-    let ctx = Job {
+    let mut ctx = Job {
         aligner: &aligner,
         opts,
         in_header: &in_header,
@@ -2089,6 +2129,7 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         pair: pair_cfg,
         pairs: AtomicU64::new(0),
         proper_pairs: AtomicU64::new(0),
+        sites: site_file.is_some().then(SiteTable::new),
     };
     let busy = dispatch(&ctx, batches, res_tx, permit_rx);
     // Join every thread before deciding which error to report: a failed stage
@@ -2129,6 +2170,14 @@ pub fn run(args: AlignArgs) -> anyhow::Result<()> {
         .or(args.r1.as_deref())
         .map_or_else(String::new, |p| p.display().to_string());
     let counts = read_result.with_context(|| format!("reading {input_name}"))?;
+    if let (Some(table), Some(file), Some(path)) =
+        (ctx.sites.take(), site_file, args.site_table.as_deref())
+    {
+        table
+            .write(aligner.panel(), file)
+            .with_context(|| format!("writing {}", path.display()))?;
+        info!("wrote {}", style::path(path.display()));
+    }
     let skipped_long = ctx.skipped_long.load(Ordering::Relaxed);
     debug!(
         "workers were busy {:.1} s of {:.1} s x {} threads; {} read strands of {}+ nt \

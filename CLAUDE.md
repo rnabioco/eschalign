@@ -185,7 +185,7 @@ would treat it as on. `clippy.toml`'s `disallowed-methods` enforces this (and
 ### Workspace layout
 
 - `crates/eschalign/` — alphabet / `Scoring` / `Mode` / scalar oracle / `simd` (two kernel families) / `sam` (CIGAR, `MD`/`NM`) / `panel` / `mapper` (`Aligner`) / `cuda` (`gpu`) / `fasta` / `error`. See its `CLAUDE.md` for the map, tests and traps.
-- `crates/eschalign-cli/src/` — `main.rs` (clap, tracing, rayon pool, allocator), `align.rs` (the pipeline), `device.rs` (`--device`), `env.rs`, `threads.rs`, `progress.rs`, `style.rs`, `uuid_util.rs`.
+- `crates/eschalign-cli/src/` — `main.rs` (clap, tracing, rayon pool, allocator), `align.rs` (the pipeline), `device.rs` (`--device`), `env.rs`, `threads.rs`, `progress.rs`, `style.rs`, `uuid_util.rs`, `sites.rs` (`--site-table` pileup: per-chunk counts merged under a mutex, no barrier; gzip TSV only, no Parquet dependency).
 - `crates/eschalign-cli/tests/` — `align_e2e.rs`, `align_sort.rs`, `align_unpaired.rs` over `tests/fixtures/` (60 real tRNA reads as a uBAM-shaped BAM plus the 47-reference panel and an ambiguity-code variant; **no pod5** — these tests never read signal), and `align_paired.rs` over `tests/fixtures/pairs/` (a synthesized 4-reference panel with two paralogs and one hand-built read pair per behaviour; `gen_pair_fixture.py` regenerates it). `align_unpaired.rs` pins the unpaired output to a golden digest of the uncompressed record stream (`fixtures/unpaired_golden.tsv`, `ESCHALIGN_BLESS=1` rewrites it) — a change to it is a change to unpaired behaviour and must be intended.
 - `crates/eschalign/tests/fixtures/` — the parasail and calmd goldens and the scripts that regenerate them (`gen_align_golden.py` needs `parasail`; `gen_calmd_golden.py` needs samtools).
 

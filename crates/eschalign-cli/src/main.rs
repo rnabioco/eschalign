@@ -25,6 +25,7 @@ mod device;
 mod env;
 mod mods;
 mod progress;
+mod sites;
 mod style;
 mod threads;
 mod uuid_util;
